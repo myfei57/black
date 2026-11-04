@@ -102,6 +102,43 @@ This also works in `pyproject.toml`:
 python-cell-magics = ["writefile", "my_custom_magic"]
 ```
 
+### Filtering code cells by tag
+
+Jupyter lets you annotate cells with
+[tags](https://jupyter-notebook.readthedocs.io/en/stable/changelog.html#cell-tags)
+(stored in each cell's `metadata.tags`). If you only want to format some of the code
+cells, pass the `--cell-tags` option:
+
+```sh
+black --cell-tags format notebook.ipynb
+```
+
+Only code cells carrying at least one of the given tags will be formatted. The option
+can be repeated to allow multiple tags (a cell is selected if it contains **any** of
+them). When `--cell-tags` is not given (or the configured list is empty), _Black_
+formats every code cell, as before. Cells without tags are treated by the same rules,
+so they are skipped once `--cell-tags` is in use.
+
+To keep certain cells untouched no matter what, use `--exclude-cell-tags`:
+
+```sh
+black --cell-tags format --exclude-cell-tags skip notebook.ipynb
+```
+
+Exclusion always takes precedence: a cell carrying an exclude tag is never formatted,
+even if it also carries an include tag.
+
+The source, outputs and metadata of cells that are not selected are left completely
+unchanged. These options affect direct formatting, `--check` and `--diff` alike.
+
+Both options can be set in `pyproject.toml`:
+
+```toml
+[tool.black]
+cell-tags = ["format"]
+exclude-cell-tags = ["skip", "no-black"]
+```
+
 ## Integrations
 
 ### pre-commit

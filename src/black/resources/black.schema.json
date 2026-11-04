@@ -52,6 +52,20 @@
       },
       "description": "When processing Jupyter Notebooks, add the given magic to the list of known python-magics (capture, prun, pypy, python, python3, time, timeit). Useful for formatting cells with custom python magics."
     },
+    "cell-tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "When processing Jupyter Notebooks, only format code cells that contain at least one of the given tags. If no tags are given, all code cells are formatted. This option can be specified multiple times, in which case a cell is selected if it carries any of the tags."
+    },
+    "exclude-cell-tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "When processing Jupyter Notebooks, do not format code cells that contain any of the given tags. Exclusion always takes precedence over --cell-tags. This option can be specified multiple times."
+    },
     "skip-source-first-line": {
       "type": "boolean",
       "description": "Skip the first line of the source code.",

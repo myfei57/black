@@ -1,4 +1,5 @@
 import contextlib
+import json
 import pathlib
 import re
 from contextlib import AbstractContextManager
@@ -12,6 +13,7 @@ from pytest import MonkeyPatch
 from black import (
     Mode,
     NothingChanged,
+    cell_selected_by_tags,
     format_cell,
     format_file_contents,
     format_file_in_place,
@@ -604,3 +606,327 @@ def test_unable_to_replace_magics(monkeypatch: MonkeyPatch) -> None:
         AssertionError, match="Black was not able to replace IPython magic"
     ):
         format_cell(src, fast=True, mode=JUPYTER_MODE)
+
+
+def _make_notebook_with_tags() -> tuple[str, dict]:
+    """Build a notebook exercising tagged, untagged and markdown cells."""
+    nb = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {"tags": ["format"], "custom": "keep"},
+                "outputs": [
+                    {"output_type": "stream", "name": "stdout", "text": ["1\n"]}
+                ],
+                "source": ["x=1\n"],
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {"tags": ["skip"]},
+                "outputs": [],
+                "source": ["y=2\n"],
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": ["z=3\n"],
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {"tags": ["format", "skip"]},
+                "outputs": [],
+                "source": ["w=4\n"],
+            },
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": ["# Title\n"],
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "outputs": [],
+                "source": ["q=5\n"],
+            },
+        ],
+        "metadata": {"language_info": {"name": "python"}},
+        "nbformat": 4,
+        "nbformat_minor": 4,
+    }
+    return json.dumps(nb, indent=1, ensure_ascii=False) + "\n", nb
+
+
+@pytest.mark.parametrize(
+    "cell, mode, selected",
+    [
+        pytest.param(
+            {"metadata": {"tags": ["a"]}},
+            JUPYTER_MODE,
+            True,
+            id="tagged cell selected without configured tags",
+        ),
+        pytest.param(
+            {"metadata": {}},
+            JUPYTER_MODE,
+            True,
+            id="cell without tags selected without configured tags",
+        ),
+        pytest.param(
+            {},
+            JUPYTER_MODE,
+            True,
+            id="cell without metadata selected without configured tags",
+        ),
+        pytest.param(
+            {"metadata": {"tags": ["a"]}},
+            replace(JUPYTER_MODE, cell_tags={"a"}),
+            True,
+            id="matching include tag",
+        ),
+        pytest.param(
+            {"metadata": {"tags": ["b"]}},
+            replace(JUPYTER_MODE, cell_tags={"a"}),
+            False,
+            id="non-matching include tag",
+        ),
+        pytest.param(
+            {"metadata": {"tags": []}},
+            replace(JUPYTER_MODE, cell_tags={"a"}),
+            False,
+            id="untagged cell skipped with include tags",
+        ),
+        pytest.param(
+            {"metadata": {}},
+            replace(JUPYTER_MODE, cell_tags={"a"}),
+            False,
+            id="missing tags skipped with include tags",
+        ),
+        pytest.param(
+            {"metadata": {"tags": ["a", "b"]}},
+            replace(JUPYTER_MODE, cell_tags={"a"}, exclude_cell_tags={"b"}),
+            False,
+            id="exclude tag takes precedence over include tag",
+        ),
+        pytest.param(
+            {"metadata": {"tags": ["b"]}},
+            replace(JUPYTER_MODE, exclude_cell_tags={"b"}),
+            False,
+            id="exclude tag only",
+        ),
+        pytest.param(
+            {"metadata": {}},
+            replace(JUPYTER_MODE, exclude_cell_tags={"b"}),
+            True,
+            id="untagged cell unaffected by exclude tags",
+        ),
+    ],
+)
+def test_cell_selected_by_tags(cell: dict, mode: Mode, selected: bool) -> None:
+    assert cell_selected_by_tags(cell, mode) is selected
+
+
+def test_cell_tags_default_formats_every_code_cell() -> None:
+    content, src_nb = _make_notebook_with_tags()
+    result = format_file_contents(content, fast=True, mode=JUPYTER_MODE)
+    result_nb = json.loads(result)
+    expected_sources = ["x = 1", "y = 2", "z = 3", "w = 4", "# Title\n", "q = 5"]
+    actual_sources = ["".join(cell["source"]) for cell in result_nb["cells"]]
+    assert actual_sources == expected_sources
+    # Outputs and metadata of all cells are carried through untouched.
+    for src_cell, result_cell in zip(src_nb["cells"], result_nb["cells"]):
+        assert result_cell.get("outputs", []) == src_cell.get("outputs", [])
+        assert result_cell.get("metadata", {}) == src_cell.get("metadata", {})
+
+
+def test_cell_tags_only_formats_matching_cells() -> None:
+    content, src_nb = _make_notebook_with_tags()
+    mode = replace(JUPYTER_MODE, cell_tags={"format"})
+    result = format_file_contents(content, fast=True, mode=mode)
+    result_nb = json.loads(result)
+
+    # Cells 0 and 3 carry the "format" tag and both get formatted.
+    assert "".join(result_nb["cells"][0]["source"]) == "x = 1"
+    assert "".join(result_nb["cells"][3]["source"]) == "w = 4"
+    # The differently-tagged cell, the untagged cells and the markdown cell
+    # are left exactly as they were (source, outputs and metadata).
+    for unchanged_index in (1, 2, 4, 5):
+        assert result_nb["cells"][unchanged_index] == src_nb["cells"][unchanged_index]
+    # Outputs and metadata (including the tag list) of the formatted cells are
+    # preserved; only their source changes.
+    for formatted_index in (0, 3):
+        assert (
+            result_nb["cells"][formatted_index]["outputs"]
+            == src_nb["cells"][formatted_index]["outputs"]
+        )
+        assert (
+            result_nb["cells"][formatted_index]["metadata"]
+            == src_nb["cells"][formatted_index]["metadata"]
+        )
+    assert result_nb["metadata"] == src_nb["metadata"]
+
+
+def test_exclude_cell_tags_takes_precedence() -> None:
+    content, src_nb = _make_notebook_with_tags()
+    mode = replace(JUPYTER_MODE, cell_tags={"format"}, exclude_cell_tags={"skip"})
+    result = format_file_contents(content, fast=True, mode=mode)
+    result_nb = json.loads(result)
+
+    assert "".join(result_nb["cells"][0]["source"]) == "x = 1"
+    # Cell 3 carries both the include and the exclude tag.
+    for unchanged_index in (1, 2, 3, 4, 5):
+        assert result_nb["cells"][unchanged_index] == src_nb["cells"][unchanged_index]
+
+
+def test_exclude_cell_tags_without_include_tags() -> None:
+    content, src_nb = _make_notebook_with_tags()
+    mode = replace(JUPYTER_MODE, exclude_cell_tags={"skip"})
+    result = format_file_contents(content, fast=True, mode=mode)
+    result_nb = json.loads(result)
+
+    assert "".join(result_nb["cells"][0]["source"]) == "x = 1"
+    assert "".join(result_nb["cells"][1]["source"]) == "y=2\n"
+    assert "".join(result_nb["cells"][2]["source"]) == "z = 3"
+    assert "".join(result_nb["cells"][3]["source"]) == "w=4\n"
+    assert "".join(result_nb["cells"][5]["source"]) == "q = 5"
+    assert result_nb["cells"][1] == src_nb["cells"][1]
+    assert result_nb["cells"][3] == src_nb["cells"][3]
+
+
+def test_cell_tags_without_matches_is_noop() -> None:
+    content, _ = _make_notebook_with_tags()
+    mode = replace(JUPYTER_MODE, cell_tags={"does-not-exist"})
+    with pytest.raises(NothingChanged):
+        format_file_contents(content, fast=True, mode=mode)
+
+
+def test_exclude_cell_tags_matching_every_change_is_noop() -> None:
+    content, _ = _make_notebook_with_tags()
+    mode = replace(JUPYTER_MODE, cell_tags={"format"}, exclude_cell_tags={"format"})
+    with pytest.raises(NothingChanged):
+        format_file_contents(content, fast=True, mode=mode)
+
+
+def _write_tagged_notebook(directory: pathlib.Path) -> pathlib.Path:
+    content, _ = _make_notebook_with_tags()
+    notebook = directory / "tagged_notebook.ipynb"
+    notebook.write_text(content, encoding="utf-8")
+    return notebook
+
+
+def test_ipynb_cli_cell_tags_in_place(tmp_path: pathlib.Path) -> None:
+    notebook = _write_tagged_notebook(tmp_path)
+    result = runner.invoke(
+        main,
+        [
+            str(notebook),
+            "--cell-tags",
+            "format",
+            f"--config={EMPTY_CONFIG}",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "1 file reformatted" in result.output
+
+    result_nb = json.loads(notebook.read_text(encoding="utf-8"))
+    assert "".join(result_nb["cells"][0]["source"]) == "x = 1"
+    assert "".join(result_nb["cells"][1]["source"]) == "y=2\n"
+    assert "".join(result_nb["cells"][2]["source"]) == "z=3\n"
+    assert "".join(result_nb["cells"][3]["source"]) == "w = 4"
+    assert result_nb["cells"][0]["outputs"] == [
+        {"output_type": "stream", "name": "stdout", "text": ["1\n"]}
+    ]
+    assert result_nb["cells"][0]["metadata"] == {
+        "tags": ["format"],
+        "custom": "keep",
+    }
+
+
+def test_ipynb_cli_cell_tags_diff(tmp_path: pathlib.Path) -> None:
+    notebook = _write_tagged_notebook(tmp_path)
+    result = runner.invoke(
+        main,
+        [
+            str(notebook),
+            "--cell-tags",
+            "format",
+            "--diff",
+            f"--config={EMPTY_CONFIG}",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "cell_0" in result.output
+    assert "cell_3" in result.output
+    assert "+x = 1" in result.output
+    assert "+w = 4" in result.output
+    # Unselected cells don't show up in the diff.
+    assert "cell_1" not in result.output
+    assert "cell_2" not in result.output
+    assert "y = 2" not in result.output
+    assert "z = 3" not in result.output
+
+
+def test_ipynb_cli_exclude_cell_takes_precedence_diff(
+    tmp_path: pathlib.Path,
+) -> None:
+    notebook = _write_tagged_notebook(tmp_path)
+    result = runner.invoke(
+        main,
+        [
+            str(notebook),
+            "--cell-tags",
+            "format",
+            "--exclude-cell-tags",
+            "skip",
+            "--diff",
+            f"--config={EMPTY_CONFIG}",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "cell_0" in result.output
+    assert "cell_3" not in result.output
+
+
+def test_ipynb_cli_cell_tags_check_when_nothing_selected(
+    tmp_path: pathlib.Path,
+) -> None:
+    notebook = _write_tagged_notebook(tmp_path)
+    result = runner.invoke(
+        main,
+        [
+            str(notebook),
+            "--cell-tags",
+            "does-not-exist",
+            "--check",
+            f"--config={EMPTY_CONFIG}",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "1 file would be left unchanged" in result.output
+    # The file must not have been modified in check mode.
+    src_content, _ = _make_notebook_with_tags()
+    assert notebook.read_text(encoding="utf-8") == src_content
+
+
+def test_ipynb_cli_cell_tags_from_pyproject_config(
+    tmp_path: pathlib.Path,
+) -> None:
+    notebook = _write_tagged_notebook(tmp_path)
+    config = tmp_path / "pyproject.toml"
+    config.write_text(
+        '[tool.black]\ncell-tags = ["format"]\nexclude-cell-tags = ["skip"]\n',
+        encoding="utf-8",
+    )
+    result = runner.invoke(main, [str(notebook), f"--config={config}"])
+    assert result.exit_code == 0
+    assert "1 file reformatted" in result.output
+
+    result_nb = json.loads(notebook.read_text(encoding="utf-8"))
+    assert "".join(result_nb["cells"][0]["source"]) == "x = 1"
+    assert "".join(result_nb["cells"][1]["source"]) == "y=2\n"
+    assert "".join(result_nb["cells"][2]["source"]) == "z=3\n"
+    assert "".join(result_nb["cells"][3]["source"]) == "w=4\n"

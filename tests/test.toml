@@ -8,6 +8,8 @@ target-version = ["py36", "py37", "py38"]
 exclude='\.pyi?$'
 include='\.py?$'
 python-cell-magics = ["custom1", "custom2"]
+cell-tags = ["tag1", "tag2"]
+exclude-cell-tags = ["skip"]
 
 [v1.0.0-syntax]
 # This shouldn't break Black.

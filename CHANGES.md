@@ -27,6 +27,9 @@
 
 - Enable the cache when using `--diff` to skip unmodified files and record unmodified
   files as well-formatted (#5499)
+- Add `--cell-tags` and `--exclude-cell-tags` options to only format code cells in
+  Jupyter Notebooks that carry (or do not carry) the given tags; both can also be set
+  as `cell-tags` and `exclude-cell-tags` in `pyproject.toml`
 
 ### Packaging
 

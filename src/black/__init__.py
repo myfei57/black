@@ -327,6 +327,27 @@ def validate_regex(
     default=[],
 )
 @click.option(
+    "--cell-tags",
+    multiple=True,
+    help=(
+        "When processing Jupyter Notebooks, only format code cells that contain"
+        " at least one of the given tags. If no tags are given, all code cells"
+        " are formatted. This option can be specified multiple times, in which"
+        " case a cell is selected if it carries any of the tags."
+    ),
+    default=[],
+)
+@click.option(
+    "--exclude-cell-tags",
+    multiple=True,
+    help=(
+        "When processing Jupyter Notebooks, do not format code cells that contain"
+        " any of the given tags. Exclusion always takes precedence over"
+        " --cell-tags. This option can be specified multiple times."
+    ),
+    default=[],
+)
+@click.option(
     "-x",
     "--skip-source-first-line",
     is_flag=True,
@@ -572,6 +593,8 @@ def main(
     pyi: bool,
     ipynb: bool,
     python_cell_magics: Sequence[str],
+    cell_tags: Sequence[str],
+    exclude_cell_tags: Sequence[str],
     skip_source_first_line: bool,
     skip_string_normalization: bool,
     skip_magic_trailing_comma: bool,
@@ -723,6 +746,8 @@ def main(
         preview=preview,
         unstable=unstable,
         python_cell_magics=set(python_cell_magics),
+        cell_tags=set(cell_tags),
+        exclude_cell_tags=set(exclude_cell_tags),
         enabled_features=set(enable_unstable_feature),
     )
 
@@ -1292,6 +1317,24 @@ def validate_metadata(nb: MutableMapping[str, Any]) -> None:
         raise NothingChanged from None
 
 
+def cell_selected_by_tags(cell: MutableMapping[str, Any], mode: Mode) -> bool:
+    """Return whether a code cell is selected for formatting by its tags.
+
+    A cell is selected when none of its tags are in
+    ``mode.exclude_cell_tags`` (exclusion always takes precedence) and either
+    no include tags are configured (all code cells are selected) or the cell
+    carries at least one tag from ``mode.cell_tags``. Cells without tags are
+    treated by the same rules, so they are skipped when include tags are
+    configured.
+    """
+    tags = cell.get("metadata", {}).get("tags", ())
+    if any(tag in mode.exclude_cell_tags for tag in tags):
+        return False
+    if not mode.cell_tags:
+        return True
+    return any(tag in mode.cell_tags for tag in tags)
+
+
 def format_ipynb_string(src_contents: str, *, fast: bool, mode: Mode) -> FileContent:
     """Format Jupyter notebook.
 
@@ -1306,7 +1349,7 @@ def format_ipynb_string(src_contents: str, *, fast: bool, mode: Mode) -> FileCon
     nb = json.loads(src_contents)
     validate_metadata(nb)
     for cell in nb["cells"]:
-        if cell.get("cell_type", None) == "code":
+        if cell.get("cell_type", None) == "code" and cell_selected_by_tags(cell, mode):
             try:
                 src = "".join(cell["source"])
                 dst = format_cell(src, fast=fast, mode=mode)

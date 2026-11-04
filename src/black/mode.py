@@ -299,6 +299,12 @@ class Mode:
     skip_source_first_line: bool = False
     magic_trailing_comma: bool = True
     python_cell_magics: set[str] = field(default_factory=set)
+    # When processing Jupyter Notebooks, only format code cells that contain at
+    # least one of these tags. An empty set means all code cells are selected.
+    cell_tags: set[str] = field(default_factory=set)
+    # Code cells containing any of these tags are never formatted. Exclusion
+    # always takes precedence over `cell_tags`.
+    exclude_cell_tags: set[str] = field(default_factory=set)
     preview: bool = False
     unstable: bool = False
     enabled_features: set[Preview] = field(default_factory=set)
@@ -329,14 +335,18 @@ class Mode:
             version_str = sha256(version_str.encode()).hexdigest()[
                 :_MAX_CACHE_KEY_PART_LENGTH
             ]
-        features_and_magics = (
+        features_magics_and_tags = (
             ",".join(sorted(f.name for f in self.enabled_features))
             + "@"
             + ",".join(sorted(self.python_cell_magics))
+            + "@"
+            + ",".join(sorted(self.cell_tags))
+            + "@"
+            + ",".join(sorted(self.exclude_cell_tags))
         )
-        features_and_magics = sha256(features_and_magics.encode()).hexdigest()[
-            :_MAX_CACHE_KEY_PART_LENGTH
-        ]
+        features_magics_and_tags = sha256(
+            features_magics_and_tags.encode()
+        ).hexdigest()[:_MAX_CACHE_KEY_PART_LENGTH]
         parts = [
             version_str,
             str(self.line_length),
@@ -347,7 +357,7 @@ class Mode:
             str(int(self.magic_trailing_comma)),
             str(int(self.preview)),
             str(int(self.unstable)),
-            features_and_magics,
+            features_magics_and_tags,
         ]
         return ".".join(parts)
 
@@ -361,6 +371,8 @@ class Mode:
             self.skip_source_first_line,
             self.magic_trailing_comma,
             frozenset(self.python_cell_magics),
+            frozenset(self.cell_tags),
+            frozenset(self.exclude_cell_tags),
             self.preview,
             self.unstable,
             frozenset(self.enabled_features),

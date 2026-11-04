@@ -1772,6 +1772,8 @@ class BlackTestCase(BlackBaseTestCase):
         self.assertEqual(config["line_length"], 79)
         self.assertEqual(config["target_version"], ["py36", "py37", "py38"])
         self.assertEqual(config["python_cell_magics"], ["custom1", "custom2"])
+        self.assertEqual(config["cell_tags"], ["tag1", "tag2"])
+        self.assertEqual(config["exclude_cell_tags"], ["skip"])
         self.assertEqual(config["exclude"], r"\.pyi?$")
         self.assertEqual(config["include"], r"\.py?$")
 
@@ -3270,6 +3272,8 @@ class TestCaching:
                 ]
             elif field.name == "python_cell_magics":
                 values = [{"magic1"}, {"magic2"}]
+            elif field.name in ("cell_tags", "exclude_cell_tags"):
+                values = [{"tag1"}, {"tag2"}]
             elif field.name == "enabled_features":
                 # If you are looking to remove one of these features, just
                 # replace it with any other feature.

@@ -127,6 +127,23 @@ magics. Useful for formatting cells with custom python magics. See the
 [Jupyter Notebooks guide](../guides/using_black_with_jupyter_notebooks.md) for more
 details.
 
+#### `--cell-tags`
+
+When processing Jupyter Notebooks, only format code cells that contain at least one of
+the given tags. If no tags are given, all code cells are formatted. Can be specified
+multiple times; a cell is then selected if it carries any of the tags. Cells without
+tags are skipped when tags are given. See the
+[Jupyter Notebooks guide](../guides/using_black_with_jupyter_notebooks.md) for more
+details.
+
+#### `--exclude-cell-tags`
+
+When processing Jupyter Notebooks, do not format code cells that contain any of the
+given tags. Exclusion always takes precedence over [`--cell-tags`](#--cell-tags). Can be
+specified multiple times. See the
+[Jupyter Notebooks guide](../guides/using_black_with_jupyter_notebooks.md) for more
+details.
+
 #### `-x, --skip-source-first-line`
 
 Skip the first line of the source code.
