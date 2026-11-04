@@ -595,6 +595,59 @@ force-exclude = '''
 
 </details>
 
+### Configuration presets
+
+Multiple named configuration presets can live in the same `pyproject.toml` under
+`[tool.black.presets.<name>]`. Select one with `--preset <name>`:
+
+```toml
+[tool.black]
+line-length = 88
+
+[tool.black.presets.ci]
+line-length = 100
+preview = true
+
+[tool.black.presets.strict]
+extends = "ci"
+target-version = ["py311"]
+skip-string-normalization = false
+```
+
+```console
+$ black --preset strict .
+```
+
+Each preset accepts the same keys as `[tool.black]`, plus `extends`. `extends` names
+another preset, or an ordered list of presets, that the preset inherits from. The named
+presets are applied in declaration order and later values override earlier ones; the
+preset's own keys then take precedence over everything it inherits. A preset may inherit
+several presets to mix and match settings:
+
+```toml
+[tool.black.presets.web]
+extends = ["ci", "django"]
+line-length = 79
+```
+
+The effective configuration for a run is built in this order, each layer overriding the
+previous one:
+
+1. Black's built-in defaults
+2. the common `[tool.black]` configuration
+3. the inherited presets (in `extends` declaration order) and the selected preset itself
+4. options explicitly passed on the command line
+
+List-valued options (such as `target-version`) are replaced wholesale instead of being
+concatenated, so a preset does not add entries to a parent's list. If no preset sets
+`target-version`, Black still infers it from the project metadata
+(`project.requires-python`) as usual.
+
+When no `--preset` is given, Black behaves exactly as before and only uses the common
+`[tool.black]` configuration. Unknown preset names, circular `extends` chains, and
+invalid configuration keys in presets are fatal errors reported before any file is
+processed; the error message names the preset (or presets) involved.
+
 ### Lookup hierarchy
 
 Command-line options have defaults that you can see in `--help`. A `pyproject.toml` can

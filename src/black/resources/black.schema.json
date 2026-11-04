@@ -173,6 +173,33 @@
       "type": "boolean",
       "description": "Skip reading and writing the cache, forcing Black to reformat all included files. Overrides --cache-dir.",
       "default": false
+    },
+    "presets": {
+      "type": "object",
+      "description": "Named configuration presets selectable with --preset. Each preset is a table accepting the same keys as [tool.black], optionally with an 'extends' key naming another preset (or an ordered list of presets) it inherits from. A selected preset overrides the common [tool.black] configuration, and command-line options take final precedence.",
+      "additionalProperties": {
+        "type": "object",
+        "description": "A named configuration preset.",
+        "properties": {
+          "extends": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Name of the preset this preset inherits from."
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Names of the presets this preset inherits from, applied in declaration order; later presets override earlier ones."
+              }
+            ],
+            "description": "Preset (or ordered list of presets) to inherit configuration from."
+          }
+        },
+        "additionalProperties": true
+      }
     }
   }
 }

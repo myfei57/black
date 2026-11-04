@@ -1,10 +1,10 @@
 import os
 import sys
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from functools import lru_cache
 from pathlib import Path
 from re import Pattern
-from typing import TYPE_CHECKING, Any, TextIO, Union
+from typing import TYPE_CHECKING, Any, Final, TextIO, Union
 
 from mypy_extensions import mypyc_attr
 from packaging.specifiers import InvalidSpecifier, Specifier, SpecifierSet
@@ -29,6 +29,19 @@ from black.report import Report
 
 if TYPE_CHECKING:
     import colorama
+
+#: Table under ``[tool.black]`` holding named configuration presets.
+PRESETS_TABLE_KEY: Final = "presets"
+#: Key inside a preset table naming the presets it inherits from.
+PRESET_EXTENDS_KEY: Final = "extends"
+
+
+class InvalidPresetError(ValueError):
+    """Raised when a named configuration preset cannot be resolved.
+
+    This covers unknown presets, circular inheritance, malformed preset
+    tables, and configuration keys that are not valid Black options.
+    """
 
 
 @lru_cache
@@ -130,15 +143,153 @@ def find_pyproject_toml(
         return None
 
 
+def _normalize_config_keys(config: dict[str, Any]) -> dict[str, Any]:
+    """Translate TOML option names to the underscore form used by Click."""
+    return {k.replace("--", "").replace("-", "_"): v for k, v in config.items()}
+
+
+def _available_presets(presets: dict[str, Any]) -> str:
+    if not presets:
+        return "(no presets are defined)"
+    return ", ".join(sorted(repr(name) for name in presets))
+
+
+def _validate_presets_table(raw_presets: Any) -> dict[str, dict[str, Any]]:
+    """Check that ``[tool.black.presets]`` is a table of preset tables."""
+    if raw_presets is None:
+        return {}
+    if not isinstance(raw_presets, dict):
+        raise InvalidPresetError(
+            f"The {PRESETS_TABLE_KEY!r} key of [tool.black] must be a table of"
+            " configuration presets."
+        )
+    presets: dict[str, dict[str, Any]] = {}
+    for name, table in raw_presets.items():
+        if not isinstance(table, dict):
+            raise InvalidPresetError(
+                f"Configuration preset {name!r} must be a table,"
+                f" got {type(table).__name__} instead."
+            )
+        presets[name] = table
+    return presets
+
+
+def _preset_parent_names(name: str, table: dict[str, Any]) -> list[str]:
+    """Return the names of the presets inherited by preset `name`.
+
+    ``extends`` may be a single preset name or an ordered list of names.
+    """
+    raw = table.get(PRESET_EXTENDS_KEY)
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list) and all(isinstance(parent, str) for parent in raw):
+        return list(raw)
+    raise InvalidPresetError(
+        f"The {PRESET_EXTENDS_KEY!r} key of configuration preset {name!r} must be"
+        " a preset name or a list of preset names."
+    )
+
+
+def resolve_preset(
+    preset_name: str,
+    raw_presets: Any,
+    *,
+    valid_config_keys: Collection[str] | None = None,
+) -> dict[str, Any]:
+    """Resolve a named preset to a flat, normalized configuration dict.
+
+    Presets inherit other presets through their ``extends`` key, which may
+    name one preset or list several presets applied in declaration order;
+    later presets override earlier ones and the preset's own keys take
+    precedence over all of its parents. Values are replaced wholesale, so
+    for example a list option overrides the parent's list instead of being
+    appended to it.
+
+    Raises InvalidPresetError for unknown presets, circular inheritance,
+    malformed tables, and (when `valid_config_keys` is provided) options
+    that are not valid Black configuration keys.
+    """
+    presets = _validate_presets_table(raw_presets)
+    resolved: dict[str, dict[str, Any]] = {}
+
+    def resolve_one(name: str, chain: list[str]) -> dict[str, Any]:
+        if name in resolved:
+            return resolved[name]
+        if name in chain:
+            cycle = chain[chain.index(name) :] + [name]
+            raise InvalidPresetError(
+                "Circular inheritance detected between configuration presets: "
+                + " -> ".join(cycle)
+            )
+        if name not in presets:
+            available = _available_presets(presets)
+            if chain:
+                raise InvalidPresetError(
+                    f"Configuration preset {name!r} extended by preset"
+                    f" {chain[-1]!r} does not exist. Available presets: {available}."
+                )
+            raise InvalidPresetError(
+                f"Unknown configuration preset {name!r}. Available presets:"
+                f" {available}."
+            )
+
+        table = presets[name]
+        merged: dict[str, Any] = {}
+        for parent_name in _preset_parent_names(name, table):
+            merged.update(resolve_one(parent_name, [*chain, name]))
+
+        own = {k: v for k, v in table.items() if k != PRESET_EXTENDS_KEY}
+        if valid_config_keys is not None:
+            invalid_keys = sorted(
+                key
+                for key in own
+                if key.replace("--", "").replace("-", "_") not in valid_config_keys
+            )
+            if invalid_keys:
+                keys_str = ", ".join(repr(key) for key in invalid_keys)
+                raise InvalidPresetError(
+                    f"Invalid configuration key(s) {keys_str} in preset {name!r}."
+                )
+        merged.update(_normalize_config_keys(own))
+        resolved[name] = merged
+        return merged
+
+    return resolve_one(preset_name, [])
+
+
 @mypyc_attr(patchable=True)
-def parse_pyproject_toml(path_config: str) -> dict[str, Any]:
+def parse_pyproject_toml(
+    path_config: str,
+    *,
+    preset: str | None = None,
+    valid_config_keys: Collection[str] | None = None,
+) -> dict[str, Any]:
     """Parse a pyproject toml file, pulling out relevant parts for Black.
 
-    If parsing fails, will raise a tomllib.TOMLDecodeError.
+    When `preset` is given, the named preset defined under
+    ``[tool.black.presets]`` is resolved (following its inheritance chain)
+    and layered on top of the common ``[tool.black]`` configuration.
+
+    If parsing fails, will raise a tomllib.TOMLDecodeError. Invalid presets
+    raise InvalidPresetError.
     """
     pyproject_toml = _load_toml(path_config)
-    config: dict[str, Any] = pyproject_toml.get("tool", {}).get("black", {})
-    config = {k.replace("--", "").replace("-", "_"): v for k, v in config.items()}
+    tool_black: dict[str, Any] = pyproject_toml.get("tool", {}).get("black", {})
+    config = _normalize_config_keys(
+        {key: value for key, value in tool_black.items() if key != PRESETS_TABLE_KEY}
+    )
+
+    if preset is not None:
+        preset_config = resolve_preset(
+            preset,
+            tool_black.get(PRESETS_TABLE_KEY),
+            valid_config_keys=valid_config_keys,
+        )
+        # The selected preset overrides the common configuration. Values
+        # replace rather than extend, so list options are not concatenated.
+        config.update(preset_config)
 
     if "target_version" not in config:
         inferred_target_version = infer_target_version(pyproject_toml)

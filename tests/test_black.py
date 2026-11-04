@@ -1987,6 +1987,398 @@ class BlackTestCase(BlackBaseTestCase):
             self.assertEqual(config["exclude"], r"\.pyi?$")
             self.assertEqual(config["include"], r"\.py?$")
 
+    def _write_preset_config(self, workspace: str, body: str) -> Path:
+        config = Path(workspace) / "pyproject.toml"
+        config.write_text(textwrap.dedent(body), encoding="utf-8")
+        return config
+
+    PRESET_CONFIG = """\
+        [project]
+        requires-python = ">=3.10"
+
+        [tool.black]
+        line-length = 100
+        target-version = ["py310"]
+        skip-string-normalization = true
+
+        [tool.black.presets.base]
+        line-length = 110
+        target-version = ["py39"]
+
+        [tool.black.presets.ci]
+        extends = "base"
+        line-length = 120
+        preview = true
+
+        [tool.black.presets.docs]
+        extends = ["base", "ci"]
+        line-length = 79
+        target-version = ["py311"]
+    """
+
+    def test_parse_pyproject_toml_without_preset_ignores_presets_table(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            config = black.parse_pyproject_toml(str(config_file))
+        self.assertEqual(config["line_length"], 100)
+        self.assertEqual(config["target_version"], ["py310"])
+        self.assertTrue(config["skip_string_normalization"])
+        self.assertNotIn("presets", config)
+
+    def test_parse_pyproject_toml_preset_overrides_common(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            config = black.parse_pyproject_toml(str(config_file), preset="ci")
+        # Own value overrides the inherited and common value.
+        self.assertEqual(config["line_length"], 120)
+        # Inherited from the "base" preset.
+        self.assertEqual(config["target_version"], ["py39"])
+        self.assertTrue(config["preview"])
+        # Keys only present in the common config are kept.
+        self.assertTrue(config["skip_string_normalization"])
+
+    def test_parse_pyproject_toml_preset_inheritance_order(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            config = black.parse_pyproject_toml(str(config_file), preset="docs")
+        # The preset's own value wins over its parents and common config.
+        self.assertEqual(config["line_length"], 79)
+        # Lists replace wholesale rather than being concatenated: the final
+        # target-version is ["py311"], not a union of py39/py310/py311.
+        self.assertEqual(config["target_version"], ["py311"])
+        self.assertTrue(config["preview"])
+        self.assertTrue(config["skip_string_normalization"])
+
+    def test_resolve_preset_lists_replace_not_concatenate(self) -> None:
+        body = """\
+            [tool.black.presets.a]
+            target-version = ["py38"]
+
+            [tool.black.presets.b]
+            target-version = ["py39"]
+
+            [tool.black.presets.c]
+            extends = ["a", "b"]
+        """
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, body)
+            config = black.parse_pyproject_toml(str(config_file), preset="c")
+        self.assertEqual(config["target_version"], ["py39"])
+
+    def test_resolve_preset_multiple_inheritance_later_wins(self) -> None:
+        body = """\
+            [tool.black.presets.a]
+            line-length = 100
+
+            [tool.black.presets.b]
+            line-length = 120
+            preview = true
+
+            [tool.black.presets.c]
+            extends = ["a", "b"]
+        """
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, body)
+            config = black.parse_pyproject_toml(str(config_file), preset="c")
+        self.assertEqual(config["line_length"], 120)
+        self.assertTrue(config["preview"])
+
+    def test_resolve_preset_diamond_inheritance(self) -> None:
+        body = """\
+            [tool.black.presets.d]
+            line-length = 90
+
+            [tool.black.presets.b1]
+            extends = "d"
+            preview = true
+
+            [tool.black.presets.b2]
+            extends = "d"
+            line-length = 95
+
+            [tool.black.presets.top]
+            extends = ["b1", "b2"]
+            line-length = 70
+        """
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, body)
+            config = black.parse_pyproject_toml(str(config_file), preset="top")
+        self.assertEqual(config["line_length"], 70)
+        self.assertTrue(config["preview"])
+
+    def test_parse_pyproject_toml_preset_still_infers_target_version(self) -> None:
+        body = """\
+            [project]
+            requires-python = ">=3.11"
+
+            [tool.black.presets.p]
+            line-length = 90
+        """
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, body)
+            config = black.parse_pyproject_toml(str(config_file), preset="p")
+        self.assertEqual(config["line_length"], 90)
+        self.assertEqual(config["target_version"][0], "py311")
+
+    def test_resolve_preset_errors(self) -> None:
+        cases = {
+            "unknown": (
+                "[tool.black.presets.x]\nline-length = 1\n",
+                "nope",
+                r"Unknown configuration preset 'nope'.*",
+            ),
+            "unknown parent": (
+                '[tool.black.presets.x]\nextends = "ghost"\n',
+                "x",
+                r".*'ghost'.*extended by preset 'x'.*",
+            ),
+            "cycle": (
+                (
+                    '[tool.black.presets.x]\nextends = "y"\n'
+                    '[tool.black.presets.y]\nextends = "x"\n'
+                ),
+                "x",
+                r"Circular inheritance.*x -> y -> x",
+            ),
+            "self cycle": (
+                '[tool.black.presets.x]\nextends = "x"\n',
+                "x",
+                r"Circular inheritance.*x -> x",
+            ),
+            "bad extends": (
+                "[tool.black.presets.x]\nextends = 5\n",
+                "x",
+                r".*'extends'.*must be.*",
+            ),
+            "non table preset": (
+                "[tool.black.presets]\nx = 5\n",
+                "x",
+                r".*preset 'x' must be a table.*",
+            ),
+        }
+        for name, (body, preset, pattern) in cases.items():
+            with self.subTest(name):
+                with TemporaryDirectory() as workspace:
+                    config_file = self._write_preset_config(workspace, body)
+                    pyproject = black.files._load_toml(config_file)
+                    raw_presets = pyproject["tool"]["black"].get("presets")
+                    with self.assertRaisesRegex(
+                        black.files.InvalidPresetError, pattern
+                    ):
+                        black.files.resolve_preset(preset, raw_presets)
+
+        with self.assertRaisesRegex(
+            black.files.InvalidPresetError,
+            r"Unknown configuration preset 'x'\. Available presets:"
+            r" \(no presets are defined\)\.",
+        ):
+            black.files.resolve_preset("x", None)
+
+    def test_resolve_preset_rejects_invalid_keys_naming_preset(self) -> None:
+        body = """\
+            [tool.black.presets.good]
+            line-length = 1
+
+            [tool.black.presets.bad]
+            extends = "good"
+            wat = 1
+        """
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, body)
+            pyproject = black.files._load_toml(config_file)
+            with self.assertRaisesRegex(
+                black.files.InvalidPresetError,
+                r"Invalid configuration key\(s\) 'wat' in preset 'bad'",
+            ):
+                black.files.resolve_preset(
+                    "bad",
+                    pyproject["tool"]["black"]["presets"],
+                    valid_config_keys={"line_length"},
+                )
+
+    def test_read_pyproject_toml_with_preset(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            fake_ctx = FakeContext()
+            fake_ctx.params["preset"] = "docs"
+            black.read_pyproject_toml(fake_ctx, None, str(config_file))
+            config = fake_ctx.default_map
+        self.assertEqual(config["line_length"], "79")
+        self.assertEqual(config["target_version"], ["py311"])
+        self.assertTrue(config["preview"])
+        self.assertNotIn("extends", config)
+        self.assertNotIn("presets", config)
+
+    def test_read_pyproject_toml_unknown_preset_raises(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            fake_ctx = FakeContext()
+            fake_ctx.params["preset"] = "nope"
+            with self.assertRaises(click.BadOptionUsage) as exc_info:
+                black.read_pyproject_toml(fake_ctx, None, str(config_file))
+            self.assertEqual(exc_info.exception.option_name, "preset")
+            self.assertIn("'nope'", exc_info.exception.message)
+            self.assertIn(str(config_file), exc_info.exception.message)
+
+    def test_cli_preset_unknown_fails_before_files(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            src = Path(workspace) / "mod.py"
+            original = "x={1:2}\n"
+            src.write_text(original, encoding="utf-8")
+            result = BlackRunner().invoke(
+                black.main,
+                ["--config", str(config_file), "--preset", "nope", str(src)],
+            )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn("Unknown configuration preset 'nope'", result.stderr)
+            self.assertIn("'base', 'ci', 'docs'", result.stderr)
+            # No file is processed before the error is raised.
+            self.assertEqual(src.read_text(encoding="utf-8"), original)
+
+    def test_cli_preset_circular_inheritance_fails(self) -> None:
+        body = """\
+            [tool.black.presets.x]
+            extends = "y"
+
+            [tool.black.presets.y]
+            extends = "x"
+        """
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, body)
+            result = BlackRunner().invoke(
+                black.main,
+                ["--config", str(config_file), "--preset", "x", "--code", "x=1"],
+            )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn("Circular inheritance", result.stderr)
+            self.assertIn("x -> y -> x", result.stderr)
+
+    def test_cli_preset_invalid_key_fails_and_names_preset(self) -> None:
+        body = """\
+            [tool.black.presets.bad]
+            not-a-real-option = true
+        """
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, body)
+            result = BlackRunner().invoke(
+                black.main,
+                ["--config", str(config_file), "--preset", "bad", "--code", "x=1"],
+            )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn("'not-a-real-option'", result.stderr)
+            self.assertIn("preset 'bad'", result.stderr)
+
+    def test_cli_preset_requested_without_config_fails(self) -> None:
+        with TemporaryDirectory() as workspace:
+            with change_directory(workspace):
+                result = BlackRunner().invoke(
+                    black.main, ["--preset", "nope", "--code", "x=1"]
+                )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn("Unknown configuration preset 'nope'", result.stderr)
+
+    def test_cli_preset_missing_presets_table_fails(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(
+                workspace, "[tool.black]\nline-length = 80\n"
+            )
+            result = BlackRunner().invoke(
+                black.main,
+                ["--config", str(config_file), "--preset", "nope", "--code", "x=1"],
+            )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn(
+                "Unknown configuration preset 'nope'. Available presets:"
+                " (no presets are defined).",
+                result.stderr,
+            )
+
+    def _spy_mode_kwargs(self, args: list[str]) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+
+        class SpyMode(black.Mode):
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+                super().__init__(**kwargs)
+
+        with patch.object(black, "Mode", SpyMode):
+            result = BlackRunner().invoke(black.main, args)
+        assert result.exit_code == 0, result.stderr
+        return captured
+
+    def test_cli_preset_applies_and_cli_options_win(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            kwargs = self._spy_mode_kwargs([
+                "--config",
+                str(config_file),
+                "--preset",
+                "ci",
+                "--line-length",
+                "50",
+                "--code",
+                "print(1)",
+            ])
+        self.assertEqual(kwargs["line_length"], 50)
+        self.assertEqual(kwargs["target_versions"], {TargetVersion.PY39})
+        self.assertTrue(kwargs["preview"])
+
+    def test_cli_preset_target_version_replaces_list(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            kwargs = self._spy_mode_kwargs([
+                "--config",
+                str(config_file),
+                "--preset",
+                "docs",
+                "-t",
+                "py37",
+                "--code",
+                "print(1)",
+            ])
+        # The CLI list replaces the preset's list outright (no concatenation).
+        self.assertEqual(kwargs["target_versions"], {TargetVersion.PY37})
+
+    def test_cli_without_preset_uses_common_config(self) -> None:
+        with TemporaryDirectory() as workspace:
+            config_file = self._write_preset_config(workspace, self.PRESET_CONFIG)
+            kwargs = self._spy_mode_kwargs(
+                ["--config", str(config_file), "--code", "print(1)"]
+            )
+        self.assertEqual(kwargs["line_length"], 100)
+        self.assertEqual(kwargs["target_versions"], {TargetVersion.PY310})
+        self.assertFalse(kwargs["preview"])
+
+    def test_preset_effective_config_isolates_cache(self) -> None:
+        with TemporaryDirectory() as workspace:
+            cache_root = Path(workspace)
+            ci = Mode(
+                target_versions={TargetVersion.PY39},
+                line_length=120,
+                preview=True,
+            )
+            docs = Mode(
+                target_versions={TargetVersion.PY311},
+                line_length=79,
+                preview=True,
+            )
+            ci_equivalent = Mode(
+                target_versions={TargetVersion.PY39},
+                line_length=120,
+                preview=True,
+            )
+            ci_cache = get_cache_file(ci, cache_root)
+            docs_cache = get_cache_file(docs, cache_root)
+            common_cache = get_cache_file(
+                Mode(target_versions={TargetVersion.PY310}, line_length=100),
+                cache_root,
+            )
+            self.assertNotEqual(ci_cache, docs_cache)
+            self.assertNotEqual(docs_cache, common_cache)
+            # The cache follows the *effective* configuration, not the name.
+            self.assertEqual(ci_cache, get_cache_file(ci_equivalent, cache_root))
+
     @pytest.mark.incompatible_with_mypyc
     def test_find_project_root(self) -> None:
         with TemporaryDirectory() as workspace:

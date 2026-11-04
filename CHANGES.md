@@ -25,6 +25,13 @@
 
 <!-- Changes to how Black can be configured -->
 
+- Add named configuration presets: multiple presets can now be defined under
+  `[tool.black.presets.<name>]` in `pyproject.toml` and selected with the new
+  `--preset` option. Presets can inherit other presets in declaration order via
+  `extends`, the selected preset overrides the common `[tool.black]` configuration,
+  and explicit command-line options still take precedence. Unknown presets, circular
+  inheritance, and invalid preset options fail before any files are processed. The
+  formatting cache is isolated per effective configuration.
 - Enable the cache when using `--diff` to skip unmodified files and record unmodified
   files as well-formatted (#5499)
 

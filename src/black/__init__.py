@@ -38,6 +38,7 @@ from black.const import (
     STDIN_PLACEHOLDER,
 )
 from black.files import (
+    InvalidPresetError,
     best_effort_relative_path,
     find_project_root,
     find_pyproject_toml,
@@ -116,6 +117,47 @@ class WriteBack(Enum):
 FileMode = Mode
 
 
+# Keys used to hand the selected preset between the eager --preset and
+# --config option callbacks (either can be processed first depending on the
+# order in which the user passed them on the command line).
+_PRESET_NAME_META_KEY = "black_preset_name"
+_CONFIG_PROCESSED_META_KEY = "black_config_processed"
+_CONFIG_PATH_META_KEY = "black_config_path"
+_EXTERNAL_DEFAULT_MAP_META_KEY = "black_external_default_map"
+
+
+def _selected_preset_name(ctx: click.Context) -> str | None:
+    """Return the preset name given with --preset, regardless of callback order."""
+    meta = getattr(ctx, "meta", None)
+    if meta is not None:
+        name: str | None = meta.get(_PRESET_NAME_META_KEY)
+        if name is not None:
+            return name
+    preset: str | None = ctx.params.get("preset")
+    return preset
+
+
+def preset_option_callback(
+    ctx: click.Context, param: click.Parameter | None, value: str | None
+) -> str | None:
+    """Remember the selected preset, (re)applying config when --config won.
+
+    Eager options are processed in the order in which they appear on the
+    command line, so an explicit ``--config FILE`` written before ``--preset``
+    is handled before this callback runs. In that case the configuration is
+    resolved once more now that the preset name is known.
+    """
+    if getattr(ctx, "meta", None) is not None:
+        ctx.meta[_PRESET_NAME_META_KEY] = value
+    if (
+        value is not None
+        and getattr(ctx, "meta", None) is not None
+        and ctx.meta.get(_CONFIG_PROCESSED_META_KEY)
+    ):
+        read_pyproject_toml(ctx, param, ctx.meta.get(_CONFIG_PATH_META_KEY))
+    return value
+
+
 def read_pyproject_toml(
     ctx: click.Context, param: click.Parameter | None, value: str | None
 ) -> str | None:
@@ -124,31 +166,57 @@ def read_pyproject_toml(
     Returns the path to a successfully found and read configuration file, None
     otherwise.
     """
+    meta = getattr(ctx, "meta", None)
+    preset_name = _selected_preset_name(ctx)
+    reapply = bool(meta and meta.get(_CONFIG_PROCESSED_META_KEY))
     if not value:
         value = find_pyproject_toml(
             ctx.params.get("src", ()), ctx.params.get("stdin_filename", None)
         )
         if value is None:
+            if meta is not None:
+                meta[_CONFIG_PROCESSED_META_KEY] = True
+                meta[_CONFIG_PATH_META_KEY] = None
+            if preset_name is not None:
+                raise click.BadOptionUsage(
+                    "preset",
+                    f"Unknown configuration preset {preset_name!r}: no"
+                    " pyproject.toml (or other configuration file) was found.",
+                    ctx,
+                )
             return None
 
+    valid_config_keys = {p.name for p in ctx.command.params if p.name}
     try:
-        config = parse_pyproject_toml(value)
+        config = parse_pyproject_toml(
+            value,
+            preset=preset_name,
+            valid_config_keys=valid_config_keys,
+        )
+    except InvalidPresetError as e:
+        raise click.BadOptionUsage("preset", f"{e} (in {value})", ctx) from None
     except (OSError, ValueError) as e:
         raise click.FileError(
             filename=value, hint=f"Error reading configuration file: {e}"
         ) from None
 
+    if meta is not None:
+        meta[_CONFIG_PROCESSED_META_KEY] = True
+        meta[_CONFIG_PATH_META_KEY] = value
+
     if not config:
-        return None
-    else:
+        return value if preset_name is not None else None
+    if not reapply:
+        # On a re-application (--config was processed first and --preset
+        # triggered a second resolution) the common keys were already checked
+        # once, and preset keys are validated hard in resolve_preset().
         spellcheck_pyproject_toml_keys(ctx, list(config), value)
-        # Sanitize the values to be Click friendly. For more information please see:
-        # https://github.com/psf/black/issues/1458
-        # https://github.com/pallets/click/issues/1567
-        config = {
-            k: str(v) if not isinstance(v, (list, dict)) else v
-            for k, v in config.items()
-        }
+    # Sanitize the values to be Click friendly. For more information please see:
+    # https://github.com/psf/black/issues/1458
+    # https://github.com/pallets/click/issues/1567
+    config = {
+        k: str(v) if not isinstance(v, (list, dict)) else v for k, v in config.items()
+    }
 
     target_version = config.get("target_version")
     if target_version is not None and not isinstance(target_version, list):
@@ -182,9 +250,16 @@ def read_pyproject_toml(
             "line-ranges", "Cannot use line-ranges in the pyproject.toml file."
         )
 
+    if meta is not None:
+        if not reapply:
+            meta[_EXTERNAL_DEFAULT_MAP_META_KEY] = dict(ctx.default_map or {})
+        external_default_map = meta.get(_EXTERNAL_DEFAULT_MAP_META_KEY, {})
+    else:
+        external_default_map = ctx.default_map or {}
+
     default_map: dict[str, Any] = {}
-    if ctx.default_map:
-        default_map.update(ctx.default_map)
+    if external_default_map:
+        default_map.update(external_default_map)
     default_map.update(config)
 
     ctx.default_map = default_map
@@ -532,6 +607,19 @@ def validate_regex(
     metavar="SRC ...",
 )
 @click.option(
+    "--preset",
+    type=str,
+    is_eager=True,
+    callback=preset_option_callback,
+    help=(
+        "Use the named configuration preset defined under [tool.black.presets]"
+        " in pyproject.toml. The preset is layered on top of the common"
+        " [tool.black] configuration (with presets it inherits applied in"
+        " declaration order), and options passed on the command line still take"
+        " precedence."
+    ),
+)
+@click.option(
     "--config",
     type=click.Path(
         exists=True,
@@ -588,6 +676,7 @@ def main(
     stdin_filename: str | None,
     workers: int | None,
     src: tuple[str, ...],
+    preset: str | None,
     config: str | None,
     cache_dir: Path | None,
     no_cache: bool,
@@ -664,6 +753,8 @@ def main(
                 out("Using configuration from project root.", fg="blue")
             else:
                 out(f"Using configuration in '{config}'.", fg="blue")
+            if preset is not None:
+                out(f"Using configuration preset {preset!r}.", fg="blue")
             if ctx.default_map:
                 for param, value in ctx.default_map.items():
                     out(f"{param}: {value}")
