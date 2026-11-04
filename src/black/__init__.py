@@ -3,6 +3,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import sys
 import tokenize
 import traceback
@@ -38,6 +39,7 @@ from black.const import (
     STDIN_PLACEHOLDER,
 )
 from black.files import (
+    OutputPathError,
     best_effort_relative_path,
     find_project_root,
     find_pyproject_toml,
@@ -47,6 +49,7 @@ from black.files import (
     parse_pyproject_toml,
     path_is_excluded,
     resolves_outside_root_or_cannot_stat,
+    resolve_output_paths,
     wrap_stream_for_windows,
 )
 from black.handle_ipynb_magics import (
@@ -558,6 +561,27 @@ def validate_regex(
         " included files. Overrides --cache-dir."
     ),
 )
+@click.option(
+    "--output-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help=(
+        "Write the formatted files to this directory instead of modifying the"
+        " source files. The relative directory structure of the inputs is"
+        " preserved and files that are already formatted are copied unchanged."
+        " Existing files in the output directory are not replaced unless"
+        " --force-overwrite is also passed. Cannot be combined with --check,"
+        " --diff, --code, or standard input."
+    ),
+)
+@click.option(
+    "--force-overwrite",
+    is_flag=True,
+    help=(
+        "With --output-dir, replace files that already exist in the output"
+        " directory. By default, Black refuses to overwrite them and aborts"
+        " before writing anything."
+    ),
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -591,6 +615,8 @@ def main(
     config: str | None,
     cache_dir: Path | None,
     no_cache: bool,
+    output_dir: Path | None,
+    force_overwrite: bool,
 ) -> None:
     """The uncompromising code formatter."""
     ctx.ensure_object(dict)
@@ -684,6 +710,33 @@ def main(
         ctx.exit(1)
 
     write_back = WriteBack.from_configuration(check=check, diff=diff, color=color)
+
+    if output_dir is not None:
+        output_dir_errors = []
+        if code is not None:
+            output_dir_errors.append("--output-dir cannot be used with -c/--code.")
+        if "-" in src:
+            output_dir_errors.append(
+                "--output-dir cannot be used with standard input; pass files or"
+                " directories as arguments instead."
+            )
+        if stdin_filename is not None:
+            output_dir_errors.append(
+                "--output-dir cannot be used with --stdin-filename."
+            )
+        if check or diff:
+            output_dir_errors.append(
+                "--output-dir cannot be combined with --check or --diff."
+            )
+        if output_dir_errors:
+            for message in output_dir_errors:
+                err(message)
+            ctx.exit(1)
+        # The cache records that formatted content lives at the source path,
+        # but in this mode the source files are deliberately never modified,
+        # so neither read nor write the regular cache.
+        no_cache = True
+
     if cache_dir is None:
         cache_dir = cache_module.CACHE_DIR
     else:
@@ -788,9 +841,24 @@ def main(
                 report.write_github_outputs(Path(os.environ["GITHUB_OUTPUT"]))
             ctx.exit(0)
 
+        output_paths: dict[Path, Path] | None = None
+        if output_dir is not None:
+            try:
+                output_paths = resolve_output_paths(
+                    srcs=src,
+                    sources=sources,
+                    output_dir=output_dir,
+                    force_overwrite=force_overwrite,
+                )
+            except OutputPathError as exc:
+                for problem in exc.problems:
+                    err(problem)
+                ctx.exit(1)
+
         if len(sources) == 1:
+            source = sources.pop()
             reformat_one(
-                src=sources.pop(),
+                src=source,
                 fast=fast,
                 write_back=write_back,
                 mode=mode,
@@ -798,6 +866,7 @@ def main(
                 lines=lines,
                 no_cache=no_cache,
                 cache_dir=cache_dir,
+                dst=output_paths[source] if output_paths is not None else None,
             )
         else:
             from black.concurrency import reformat_many
@@ -814,6 +883,7 @@ def main(
                 workers=workers,
                 no_cache=no_cache,
                 cache_dir=cache_dir,
+                output_paths=output_paths,
             )
 
     if verbose or not quiet:
@@ -978,11 +1048,15 @@ def reformat_one(
     lines: Collection[tuple[int, int]] = (),
     no_cache: bool = False,
     cache_dir: Path | None = None,
+    dst: Path | None = None,
 ) -> None:
     """Reformat a single file under `src` without spawning child processes.
 
     `fast`, `write_back`, and `mode` options are passed to
     :func:`format_file_in_place` or :func:`format_stdin_to_stdout`.
+
+    If `dst` is given, the (possibly formatted) contents are written there
+    instead of back to `src`; see :func:`format_file_in_place` for details.
     """
     try:
         changed = Changed.NO
@@ -1007,7 +1081,11 @@ def reformat_one(
             ):
                 changed = Changed.YES
         else:
-            if no_cache:
+            if dst is not None:
+                # Writing to an output directory must never touch the regular
+                # cache (which tracks formatting state at the source path).
+                cache = None
+            elif no_cache:
                 cache = None
             elif cache_dir is None:
                 cache = Cache.read(mode)
@@ -1017,7 +1095,12 @@ def reformat_one(
                 if not cache.is_changed(src):
                     changed = Changed.CACHED
             if changed is not Changed.CACHED and format_file_in_place(
-                src, fast=fast, write_back=write_back, mode=mode, lines=lines
+                src,
+                fast=fast,
+                write_back=write_back,
+                mode=mode,
+                lines=lines,
+                dst=dst,
             ):
                 changed = Changed.YES
             can_cache_unmodified = (
@@ -1050,12 +1133,19 @@ def format_file_in_place(
     lock: Any = None,  # multiprocessing.Manager().Lock() is some crazy proxy
     *,
     lines: Collection[tuple[int, int]] = (),
+    dst: Path | None = None,
 ) -> bool:
     """Format file under `src` path. Return True if changed.
 
     If `write_back` is DIFF, write a diff to stdout. If it is YES, write reformatted
     code to the file.
     `mode` and `fast` options are passed to :func:`format_file_contents`.
+
+    If `dst` is set (used together with `write_back` set to YES by the
+    ``--output-dir`` option), write to `dst` instead of `src`, creating parent
+    directories as needed. The source file is then never modified, and files
+    that do not need reformatting are copied byte-for-byte so that they are
+    still present in the output tree.
     """
     if src.suffix == ".pyi":
         mode = replace(mode, is_pyi=True)
@@ -1073,6 +1163,8 @@ def format_file_in_place(
             src_contents, fast=fast, mode=mode, lines=lines
         )
     except NothingChanged:
+        if write_back == WriteBack.YES and dst is not None:
+            _copy_file_to_output(src, dst)
         return False
     except JSONDecodeError:
         raise ValueError(
@@ -1087,7 +1179,10 @@ def format_file_in_place(
     dst_contents = header_str + dst_contents
 
     if write_back == WriteBack.YES:
-        with open(src, "w", encoding=encoding, newline=newline) as f:
+        output_path = dst if dst is not None else src
+        if dst is not None:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding=encoding, newline=newline) as f:
             f.write(dst_contents)
     elif write_back in (WriteBack.DIFF, WriteBack.COLOR_DIFF):
         now = datetime.now(timezone.utc)
@@ -1110,6 +1205,18 @@ def format_file_in_place(
             )
 
     return True
+
+
+def _copy_file_to_output(src: Path, dst: Path) -> None:
+    """Copy an already-formatted `src` file byte-for-byte to `dst`.
+
+    When writing to an output directory, files that don't need reformatting
+    must still appear in the output tree. A raw copy guarantees that their
+    encoding, newline style, and first line are preserved exactly.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(src, "rb") as in_buf, open(dst, "wb") as out_buf:
+        shutil.copyfileobj(in_buf, out_buf)
 
 
 def format_stdin_to_stdout(

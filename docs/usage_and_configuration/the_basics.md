@@ -229,6 +229,37 @@ All done! ✨ 🍰 ✨
 1 file would be reformatted.
 ```
 
+(labels/output-dir)=
+
+#### `--output-dir`
+
+Write the formatted files into this directory instead of modifying the source files in
+place. The relative directory structure of the inputs is preserved, and files that are
+already formatted are copied unchanged with their original encoding, newline style,
+and skipped first line. This is useful for reviewing _Black_'s changes or packaging a
+formatted copy of a codebase.
+
+```console
+$ black src --output-dir /tmp/formatted_src
+reformatted /tmp/formatted_src/pkg/app.py
+All done! ✨ 🍰 ✨
+1 file reformatted, 1 file left unchanged.
+```
+
+By default, _Black_ refuses to replace files that already exist in the output
+directory, and the whole run is aborted before anything is written. Pass
+`--force-overwrite` to allow existing output files to be replaced.
+
+The run is also rejected before writing anything when:
+
+- the output directory is the same as, or inside, a directory that is being formatted;
+- a source file would be written to itself;
+- the selected files cannot be mapped to unique output paths (for example because two
+  inputs would produce the same relative path); or
+- the input comes from standard input or `--code`.
+
+This option cannot be combined with `--check`, `--diff`, `--code`, or standard input.
+
 #### `--no-cache`
 
 Do not consult or update Black's per-user cache during this run. When `--no-cache` is

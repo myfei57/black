@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import io
 import itertools
+import json
 import logging
 import multiprocessing
 import os
@@ -197,8 +198,7 @@ def test_invalid_input_error_includes_path_location(tmp_path: Path) -> None:
         f"error: cannot parse: {source}:1:7\n"
         "    return if you can\n"
         "          ^\n"
-        "ParseError: bad input\n"
-        in result.stderr
+        "ParseError: bad input\n" in result.stderr
     )
 
     second_source = tmp_path / "also_invalid.py"
@@ -216,6 +216,309 @@ def test_invalid_input_error_includes_path_location(tmp_path: Path) -> None:
     assert result.exit_code == 123
     assert f"error: cannot parse: {source}:1:7\n" in result.stderr
     assert f"error: cannot parse: {second_source}:1:6\n" in result.stderr
+
+
+def _invoke_with_empty_config(args: list[str], *, input: bytes | None = None):
+    return BlackRunner().invoke(
+        black.main,
+        ["--config", str(THIS_DIR / "empty.toml"), *args],
+        input=BytesIO(input) if input is not None else None,
+        catch_exceptions=False,
+    )
+
+
+def test_output_dir_writes_formatted_tree_and_leaves_sources_untouched(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "proj"
+    (root / "pkg").mkdir(parents=True)
+    (root / "nested" / "deep").mkdir(parents=True)
+
+    to_format = root / "pkg" / "a.py"
+    to_format.write_text("x=1\n", encoding="utf8")
+    stub_file = root / "pkg" / "b.pyi"
+    stub_file.write_text("def f( x:int )->int:...\n", encoding="utf8")
+    already_formatted = root / "c.py"
+    already_formatted.write_text("z = 3\n", encoding="utf8")
+    deep_file = root / "nested" / "deep" / "d.py"
+    deep_file.write_text("y=1\n", encoding="utf8")
+
+    original_bytes = {p: p.read_bytes() for p in (to_format, stub_file, deep_file)}
+
+    output_dir = tmp_path / "out"
+    result = _invoke_with_empty_config([str(root), "--output-dir", str(output_dir)])
+
+    assert result.exit_code == 0, result.stderr
+    assert "reformatted" in result.stderr
+    # sources are never touched
+    for path, contents in original_bytes.items():
+        assert path.read_bytes() == contents
+
+    assert (output_dir / "pkg" / "a.py").read_text(encoding="utf8") == "x = 1\n"
+    assert (output_dir / "pkg" / "b.pyi").read_text(encoding="utf8") == (
+        "def f(x: int) -> int: ...\n"
+    )
+    assert (output_dir / "nested" / "deep" / "d.py").read_text(encoding="utf8") == (
+        "y = 1\n"
+    )
+    # unchanged files are copied as well, byte for byte
+    assert (output_dir / "c.py").read_bytes() == already_formatted.read_bytes()
+    # nothing stray was written
+    assert {p.name for p in output_dir.rglob("*") if p.is_file()} == {
+        "a.py",
+        "b.pyi",
+        "c.py",
+        "d.py",
+    }
+
+
+def test_output_dir_preserves_newline_encoding_and_first_line(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+
+    crlf = root / "crlf.py"
+    crlf.write_bytes(b"x=1\r\ny=2\r\n")
+
+    first_line = root / "script.py"
+    first_line.write_bytes(b"#!/usr/bin/env python\r\nprint( 'hi' )\r\n")
+
+    unchanged = root / "unchanged.py"
+    unchanged.write_bytes(b"z = 3\r\n")
+
+    output_dir = tmp_path / "out"
+    result = _invoke_with_empty_config(
+        [str(root), "--output-dir", str(output_dir), "-x"]
+    )
+
+    assert result.exit_code == 0, result.stderr
+    # the skipped first line stays untouched; the rest is formatted with CRLF
+    assert (output_dir / "crlf.py").read_bytes() == b"x=1\r\ny = 2\r\n"
+    assert (output_dir / "script.py").read_bytes() == (
+        b'#!/usr/bin/env python\r\nprint("hi")\r\n'
+    )
+    # unchanged files are copied byte for byte, keeping CRLF
+    assert (output_dir / "unchanged.py").read_bytes() == unchanged.read_bytes()
+
+
+def test_output_dir_preserves_non_utf8_encoding(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    # declared and actually encoded as latin-1; the non-ASCII byte must round-trip
+    latin1 = root / "latin1.py"
+    latin1.write_bytes("# -*- coding: latin-1 -*-\nx='\xe9'\n".encode("latin-1"))
+
+    output_dir = tmp_path / "out"
+    result = _invoke_with_empty_config([str(root), "--output-dir", str(output_dir)])
+
+    assert result.exit_code == 0, result.stderr
+    assert (output_dir / "latin1.py").read_bytes() == (
+        b'# -*- coding: latin-1 -*-\nx = "\xe9"\n'
+    )
+    # the source stays untouched, including its (unformatted) single quotes
+    assert latin1.read_bytes() == "# -*- coding: latin-1 -*-\nx='\xe9'\n".encode(
+        "latin-1"
+    )
+
+
+def test_output_dir_refuses_existing_files_without_force(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    source = root / "a.py"
+    source.write_text("x=1\n", encoding="utf8")
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    existing = output_dir / "a.py"
+    existing.write_text("# keep me\n", encoding="utf8")
+
+    result = _invoke_with_empty_config([str(root), "--output-dir", str(output_dir)])
+
+    assert result.exit_code == 1
+    assert "refusing to overwrite existing file" in result.stderr
+    assert existing.read_text(encoding="utf8") == "# keep me\n"
+    assert source.read_text(encoding="utf8") == "x=1\n"
+
+    # explicit override replaces it
+    result = _invoke_with_empty_config(
+        [str(root), "--output-dir", str(output_dir), "--force-overwrite"]
+    )
+    assert result.exit_code == 0, result.stderr
+    assert existing.read_text(encoding="utf8") == "x = 1\n"
+    assert source.read_text(encoding="utf8") == "x=1\n"
+
+
+def test_output_dir_rejects_output_inside_input(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "a.py").write_text("x=1\n", encoding="utf8")
+
+    nested = root / "generated"
+    result = _invoke_with_empty_config([str(root), "--output-dir", str(nested)])
+    assert result.exit_code == 1
+    assert "is inside the input directory" in result.stderr
+    assert not nested.exists()
+
+    same = root
+    result = _invoke_with_empty_config([str(root), "--output-dir", str(same)])
+    assert result.exit_code == 1
+    assert "is the same as the input directory" in result.stderr
+    # still untouched
+    assert (root / "a.py").read_text(encoding="utf8") == "x=1\n"
+
+
+def test_output_dir_rejects_coinciding_source_and_destination(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    source = root / "a.py"
+    source.write_text("x=1\n", encoding="utf8")
+
+    result = _invoke_with_empty_config([str(source), "--output-dir", str(root)])
+    assert result.exit_code == 1
+    assert "same file as the source" in result.stderr
+    assert source.read_text(encoding="utf8") == "x=1\n"
+
+
+def test_output_dir_rejects_incompatible_inputs_and_modes(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "a.py").write_text("x=1\n", encoding="utf8")
+    out = str(tmp_path / "out")
+
+    result = _invoke_with_empty_config(["-", "--output-dir", out], input=b"x=1\n")
+    assert result.exit_code == 1
+    assert "standard input" in result.stderr
+
+    result = _invoke_with_empty_config(
+        ["-", "--stdin-filename", "w.py", "--output-dir", out], input=b"x=1\n"
+    )
+    assert result.exit_code == 1
+    assert "--stdin-filename" in result.stderr
+
+    result = _invoke_with_empty_config(["-c", "x=1", "--output-dir", out])
+    assert result.exit_code == 1
+    assert "--code" in result.stderr
+
+    result = _invoke_with_empty_config([str(root), "--output-dir", out, "--check"])
+    assert result.exit_code == 1
+    assert "--check" in result.stderr
+
+    result = _invoke_with_empty_config([str(root), "--output-dir", out, "--diff"])
+    assert result.exit_code == 1
+    assert "--diff" in result.stderr
+
+    assert not (tmp_path / "out").exists()
+
+
+def test_output_dir_rejects_colliding_relative_paths(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "x.py").write_text("x=1\n", encoding="utf8")
+    (second / "x.py").write_text("x=2\n", encoding="utf8")
+
+    output_dir = tmp_path / "out"
+    result = _invoke_with_empty_config(
+        [str(first), str(second), "--output-dir", str(output_dir)]
+    )
+    assert result.exit_code == 1
+    assert "would both be written to" in result.stderr
+    assert "x.py" in result.stderr
+    assert not output_dir.exists()
+
+
+def test_output_dir_rejects_overlapping_input_roots(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "pkg").mkdir(parents=True)
+    source = root / "pkg" / "a.py"
+    source.write_text("x=1\n", encoding="utf8")
+
+    output_dir = tmp_path / "out"
+    result = _invoke_with_empty_config(
+        [str(root), str(source), "--output-dir", str(output_dir)]
+    )
+    assert result.exit_code == 1
+    assert "multiple input paths" in result.stderr
+    assert not output_dir.exists()
+
+
+def test_output_dir_multiple_file_arguments_in_sibling_dirs(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    to_format = first / "x.py"
+    to_format.write_text("x=1\n", encoding="utf8")
+    already_formatted = second / "y.py"
+    already_formatted.write_text("y = 2\n", encoding="utf8")
+
+    output_dir = tmp_path / "out"
+    result = _invoke_with_empty_config(
+        [str(to_format), str(already_formatted), "--output-dir", str(output_dir)]
+    )
+    assert result.exit_code == 0, result.stderr
+    assert (output_dir / "x.py").read_text(encoding="utf8") == "x = 1\n"
+    assert (output_dir / "y.py").read_bytes() == already_formatted.read_bytes()
+    assert to_format.read_text(encoding="utf8") == "x=1\n"
+
+
+@pytest.mark.jupyter
+def test_output_dir_formats_notebook(tmp_path: Path) -> None:
+    if not black.jupyter_dependencies_are_installed(warn=False):
+        pytest.skip("The Jupyter dependencies are not installed.")
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    notebook = root / "nb.ipynb"
+    notebook.write_text(
+        json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "metadata": {},
+                        "source": ["x=1\n"],
+                    }
+                ],
+                "metadata": {},
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            }
+        ),
+        encoding="utf8",
+    )
+
+    output_dir = tmp_path / "out"
+    result = _invoke_with_empty_config([str(root), "--output-dir", str(output_dir)])
+    assert result.exit_code == 0, result.stderr
+
+    output_notebook = output_dir / "nb.ipynb"
+    assert "x = 1" in output_notebook.read_text(encoding="utf8")
+    assert "x=1" in notebook.read_text(encoding="utf8")
+
+
+def test_resolve_output_paths_plans_relative_structure(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "pkg").mkdir(parents=True)
+    source = root / "pkg" / "a.py"
+    source.write_text("x=1\n", encoding="utf8")
+    output_dir = tmp_path / "out"
+
+    plan = black.files.resolve_output_paths(
+        srcs=[str(root)],
+        sources={source},
+        output_dir=output_dir,
+        force_overwrite=False,
+    )
+    assert plan == {source: output_dir / "pkg" / "a.py"}
+
+    with pytest.raises(black.files.OutputPathError):
+        black.files.resolve_output_paths(
+            srcs=[str(root)],
+            sources={source},
+            output_dir=root,
+            force_overwrite=True,
+        )
 
 
 class BlackTestCase(BlackBaseTestCase):

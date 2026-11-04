@@ -173,6 +173,15 @@
       "type": "boolean",
       "description": "Skip reading and writing the cache, forcing Black to reformat all included files. Overrides --cache-dir.",
       "default": false
+    },
+    "output-dir": {
+      "type": "string",
+      "description": "Write the formatted files to this directory instead of modifying the source files. The relative directory structure of the inputs is preserved and files that are already formatted are copied unchanged. Existing files in the output directory are not replaced unless --force-overwrite is also passed. Cannot be combined with --check, --diff, --code, or standard input."
+    },
+    "force-overwrite": {
+      "type": "boolean",
+      "description": "With --output-dir, replace files that already exist in the output directory. By default, Black refuses to overwrite them and aborts before writing anything.",
+      "default": false
     }
   }
 }

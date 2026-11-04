@@ -25,6 +25,14 @@
 
 <!-- Changes to how Black can be configured -->
 
+- Added the `--output-dir` option, which writes the formatted (and unchanged)
+  files into a separate directory while preserving the relative directory
+  structure of the inputs, leaving the source files untouched. Existing files
+  in the output directory are only replaced with the new `--force-overwrite`
+  option. Standard input, `--code`, `--check`, `--diff`, output paths inside
+  the input tree, coinciding source and destination paths, and inputs that
+  cannot be mapped to a unique output path are all rejected before anything is
+  written.
 - Enable the cache when using `--diff` to skip unmodified files and record unmodified
   files as well-formatted (#5499)
 

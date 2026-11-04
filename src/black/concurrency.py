@@ -14,6 +14,7 @@ import sys
 import traceback
 from collections.abc import Iterable
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
 from multiprocessing import Manager
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,7 @@ def reformat_many(
     workers: int | None,
     no_cache: bool = False,
     cache_dir: Path | None = None,
+    output_paths: dict[Path, Path] | None = None,
 ) -> None:
     """Reformat multiple files using a ProcessPoolExecutor."""
 
@@ -145,6 +147,7 @@ def reformat_many(
                 executor=executor,
                 no_cache=no_cache,
                 cache_dir=cache_dir,
+                output_paths=output_paths,
             )
         )
     finally:
@@ -166,13 +169,16 @@ async def schedule_formatting(
     executor: Executor,
     no_cache: bool = False,
     cache_dir: Path | None = None,
+    output_paths: dict[Path, Path] | None = None,
 ) -> None:
     """Run formatting of `sources` in parallel using the provided `executor`.
 
     (Use ProcessPoolExecutors for actual parallelism.)
 
     `write_back`, `fast`, and `mode` options are passed to
-    :func:`format_file_in_place`.
+    :func:`format_file_in_place`. When `output_paths` maps a source to a
+    destination, the result is written there instead of back to the source
+    (used by the ``--output-dir`` command line option).
     """
     if no_cache:
         cache = None
@@ -198,14 +204,24 @@ async def schedule_formatting(
         lock = manager.Lock()
 
     try:
-        tasks = {
-            asyncio.ensure_future(
-                loop.run_in_executor(
+        tasks = {}
+        for src in sorted(sources):
+            if output_paths is None:
+                task = loop.run_in_executor(
                     executor, format_file_in_place, src, fast, mode, write_back, lock
                 )
-            ): src
-            for src in sorted(sources)
-        }
+            else:
+                formatter = partial(
+                    format_file_in_place,
+                    src,
+                    fast,
+                    mode,
+                    write_back,
+                    lock,
+                    dst=output_paths[src],
+                )
+                task = loop.run_in_executor(executor, formatter)
+            tasks[asyncio.ensure_future(task)] = src
         pending = set(tasks)
         try:
             loop.add_signal_handler(signal.SIGINT, cancel, pending)
@@ -235,7 +251,8 @@ async def schedule_formatting(
             else:
                 changed = Changed.YES if task.result() else Changed.NO
                 can_cache_unmodified = (
-                    write_back in (
+                    write_back
+                    in (
                         WriteBack.CHECK,
                         WriteBack.DIFF,
                         WriteBack.COLOR_DIFF,

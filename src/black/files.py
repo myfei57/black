@@ -347,6 +347,132 @@ def path_is_excluded(
     return bool(match and match.group(0))
 
 
+class OutputPathError(Exception):
+    """Raised when selected files cannot be safely mapped to an output directory.
+
+    `problems` lists every issue found, allowing the caller to report all of
+    them at once instead of aborting on the first.
+    """
+
+    def __init__(self, problems: list[str]) -> None:
+        self.problems = problems
+        super().__init__("; ".join(problems))
+
+
+def resolve_output_paths(
+    *,
+    srcs: Sequence[str],
+    sources: Iterable[Path],
+    output_dir: Path,
+    force_overwrite: bool,
+) -> dict[Path, Path]:
+    """Map each selected `sources` entry to its destination under `output_dir`.
+
+    Files discovered while scanning a directory argument are mapped relative to
+    that directory; files passed as individual arguments are mapped relative to
+    their parent directory. The relative directory structure is therefore
+    preserved.
+
+    Every safety check is performed up front and nothing on disk is modified.
+    OutputPathError is raised (potentially with several problems) when:
+
+    - the output directory is the same as, or nested inside, a directory that
+      Black is scanning (the output tree must not be part of the input tree);
+    - a source can be reached from more than one input argument, so its
+      relative output path would be ambiguous;
+    - two sources would be written to the same destination;
+    - a destination is the same file as its source; or
+    - a destination already exists and overwriting was not explicitly allowed.
+    """
+    problems: list[str] = []
+    out_dir = output_dir.resolve()
+
+    roots: list[Path] = []
+    input_dirs: list[Path] = []
+    for src in srcs:
+        if src == "-":
+            continue
+        resolved_src = Path(src).resolve()
+        root = resolved_src if resolved_src.is_dir() else resolved_src.parent
+        if root not in roots:
+            roots.append(root)
+        if resolved_src.is_dir():
+            input_dirs.append(resolved_src)
+
+    for input_dir in input_dirs:
+        if out_dir == input_dir:
+            problems.append(
+                f"output directory '{out_dir}' is the same as the input directory"
+                f" '{input_dir}'"
+            )
+        else:
+            try:
+                out_dir.relative_to(input_dir)
+            except ValueError:
+                pass
+            else:
+                problems.append(
+                    f"output directory '{out_dir}' is inside the input directory"
+                    f" '{input_dir}', refusing to write the output into the input"
+                    " tree"
+                )
+
+    destinations: dict[Path, Path] = {}
+    claimed: dict[Path, Path] = {}
+    for source in sources:
+        resolved_source = source.resolve()
+        matches: list[tuple[Path, Path]] = []
+        for root in roots:
+            try:
+                relative = resolved_source.relative_to(root)
+            except ValueError:
+                continue
+            matches.append((root, relative))
+
+        if not matches:
+            problems.append(
+                f"cannot determine a unique output path for '{source}': it is not"
+                " reachable from any of the given input paths"
+            )
+            continue
+        if len(matches) > 1:
+            root_names = ", ".join(f"'{root}'" for root, _ in matches)
+            problems.append(
+                f"cannot determine a unique output path for '{source}': it is"
+                f" reachable from multiple input paths ({root_names})"
+            )
+            continue
+
+        relative = matches[0][1]
+        destination = out_dir / relative
+        if destination.resolve() == resolved_source:
+            problems.append(
+                f"refusing to write '{source}' to itself: the output path"
+                f" '{destination}' is the same file as the source"
+            )
+            continue
+        if relative in claimed:
+            problems.append(
+                f"'{source}' and '{claimed[relative]}' would both be written to"
+                f" '{destination}', so their output paths cannot be told apart"
+            )
+            continue
+        if destination.exists() and not force_overwrite:
+            problems.append(
+                f"refusing to overwrite existing file '{destination}'; pass"
+                " --force-overwrite to replace files that already exist in the"
+                " output directory"
+            )
+            continue
+
+        claimed[relative] = source
+        destinations[source] = destination
+
+    if problems:
+        raise OutputPathError(problems)
+    return destinations
+
+
 def gen_python_files(
     paths: Iterable[Path],
     root: Path,
