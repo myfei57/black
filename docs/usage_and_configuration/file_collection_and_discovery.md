@@ -50,3 +50,37 @@ If `--exclude` is not set, _Black_ will automatically ignore files and directori
 
 If you want _Black_ to continue using `.gitignore` while also configuring the exclusion
 rules, please use `--extend-exclude`.
+
+## Explaining why a file is selected or ignored
+
+To debug file discovery, pass `--explain-file-selection FILE` together with the
+directory that should be scanned as `SRC`. _Black_ performs the exact same recursive
+scan it would run for formatting, but only reports whether `FILE` would be selected and
+the first rule that decides its fate:
+
+```console
+$ black --explain-file-selection notes.txt .
+/proj/notes.txt would not be selected: does not match the --include regular expression
+```
+
+The possible reasons are:
+
+- a `.gitignore` rule, including the file and line number of the rule that took effect
+  (nested `.gitignore` files and negation rules are handled exactly like in a normal
+  scan);
+- an ancestor directory being excluded before the scan could reach the file (by
+  `.gitignore` or any exclusion regex);
+- the `--exclude`, `--extend-exclude` or `--force-exclude` regular expressions, checked
+  in that order;
+- the file not matching the `--include` regular expression;
+- the path being a symbolic link that points outside the project root.
+
+The checks use the same project root, path normalization and priority as a normal
+recursive scan, and `.gitignore` files inside directories that are excluded before
+being reached are not read. `FILE` must be an existing file inside the `SRC` directory;
+a missing, invalid or out-of-directory target is reported as an error. The explanation
+mode never reads or formats the file's contents, does not create or update the cache and
+does not modify any files.
+
+The exit code is `0` when the file would be selected, `1` when it would not be selected,
+and `2` on an invocation error.

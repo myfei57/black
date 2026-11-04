@@ -1,6 +1,7 @@
 import os
 import sys
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from re import Pattern
@@ -347,6 +348,287 @@ def path_is_excluded(
 ) -> bool:
     match = pattern.search(normalized_path) if pattern else None
     return bool(match and match.group(0))
+
+
+class InvalidFileSelectionTarget(Exception):
+    """The scan entry or target file given to the explanation mode is invalid."""
+
+
+@dataclass(frozen=True)
+class GitignoreMatch:
+    """The .gitignore rule that decided a path is ignored.
+
+    ``gitignore`` is the .gitignore file containing the rule, ``line`` its
+    1-based line number and ``rule`` the raw rule text (without its line
+    terminator).
+    """
+
+    gitignore: Path
+    line: int
+    rule: str
+
+
+@dataclass(frozen=True)
+class SelectionExplanation:
+    """Whether one file is selected by a recursive scan, and why (or why not).
+
+    ``path`` is the file as the recursive scan sees it. ``selected`` says
+    whether a normal scan would yield it. When it is False, ``reason`` is a
+    human-readable description of the first check that ruled the file (or an
+    ancestor of it) out. ``gitignore_match`` locates the decisive .gitignore
+    rule, if any, and ``excluded_ancestor`` is the directory excluded before
+    the scan could reach the file, if any.
+    """
+
+    path: Path
+    selected: bool
+    reason: str = ""
+    gitignore_match: GitignoreMatch | None = None
+    excluded_ancestor: Path | None = None
+
+
+def _gitignore_match_from_result(
+    gitignore_path: Path, spec: GitIgnoreSpec, index: int | None
+) -> GitignoreMatch:
+    """Build a `GitignoreMatch` from a pathspec ``check_file`` result.
+
+    pathspec keeps one pattern per input line (blank lines and comments get a
+    pattern with ``include=None``), and Black builds specs from
+    ``readlines()``, so the pattern index is the rule's 0-based line number.
+    """
+    line = 0
+    rule = ""
+    if index is not None:
+        line = index + 1
+        patterns = spec.patterns
+        if 0 <= index < len(patterns):
+            rule = str(patterns[index].pattern).rstrip("\r\n")
+    return GitignoreMatch(gitignore_path / ".gitignore", line, rule)
+
+
+def _find_gitignore_match(
+    root_relative_path: str,
+    root: Path,
+    gitignore_dict: dict[Path, GitIgnoreSpec],
+) -> GitignoreMatch | None:
+    """Report the .gitignore rule ignoring ``root_relative_path``, if any.
+
+    This mirrors `_path_is_ignored` exactly, including the requirement that
+    ``gitignore_dict`` is ordered from the least specific to the most specific
+    directory, but uses pathspec's ``check_file`` to additionally locate the
+    decisive rule. The first .gitignore file in order whose spec ignores the
+    path decides; within one file, the last matching rule wins (so negation
+    rules are honored).
+    """
+    path = root / root_relative_path
+    is_dir = path.is_dir()
+    for gitignore_path, spec in gitignore_dict.items():
+        try:
+            relative_path = path.relative_to(gitignore_path).as_posix()
+        except ValueError:
+            break
+        if is_dir:
+            relative_path += "/"
+        result = spec.check_file(relative_path)
+        if result.include:
+            return _gitignore_match_from_result(gitignore_path, spec, result.index)
+    return None
+
+
+def _prepare_explain_paths(
+    entry: Path | str, target: Path | str, root: Path
+) -> tuple[Path, Path]:
+    """Validate and canonicalize the explanation mode's entry and target.
+
+    Containment is checked lexically so a symbolic link *inside* the entry
+    stays a link during the simulated traversal (and is caught by the symlink
+    check if it points outside the project root), while paths escaping the
+    entry with ``..`` are rejected.
+    """
+    try:
+        entry_abs = Path(os.path.abspath(Path(entry)))
+        target_abs = Path(os.path.abspath(Path(target)))
+        resolved_entry = _cached_resolve(entry_abs)
+    except (OSError, ValueError) as e:
+        raise InvalidFileSelectionTarget(f"invalid path: {e}") from e
+
+    if not entry_abs.is_dir():
+        raise InvalidFileSelectionTarget(
+            f"scan entry is not an existing directory: {entry_abs}"
+        )
+    if not target_abs.exists():
+        raise InvalidFileSelectionTarget(f"target file does not exist: {target_abs}")
+    if not target_abs.is_file():
+        raise InvalidFileSelectionTarget(f"target is not a file: {target_abs}")
+
+    try:
+        relative = target_abs.relative_to(entry_abs)
+    except ValueError:
+        raise InvalidFileSelectionTarget(
+            f"target file is outside the scan entry directory: {target_abs}"
+        ) from None
+    if not relative.parts:
+        raise InvalidFileSelectionTarget(
+            f"target file is the scan entry directory itself: {target_abs}"
+        )
+
+    # Canonicalize the entry the same way `get_sources` does for directories.
+    try:
+        entry_path = root / resolved_entry.relative_to(root)
+    except ValueError:
+        raise InvalidFileSelectionTarget(
+            f"scan entry resolves outside the project root {root}: {entry_abs}"
+        ) from None
+
+    return entry_path, entry_path / relative
+
+
+def _selection_explanation_for_path(
+    path: Path,
+    root: Path,
+    exclude: Pattern[str],
+    extend_exclude: Pattern[str] | None,
+    force_exclude: Pattern[str] | None,
+    gitignore_dict: dict[Path, GitIgnoreSpec] | None,
+) -> SelectionExplanation | None:
+    """Explain whether one traversed path is excluded, or None if it passes.
+
+    The checks are applied in the exact same order as in `gen_python_files`:
+    .gitignore, then --exclude, --extend-exclude, --force-exclude, and finally
+    the symbolic link / stat check.
+    """
+    root_relative_path = path.relative_to(root).as_posix()
+    is_dir = path.is_dir()
+
+    if gitignore_dict is not None:
+        match = _find_gitignore_match(root_relative_path, root, gitignore_dict)
+        if match is not None:
+            detail = (
+                f"matches a .gitignore rule at {match.gitignore}:{match.line}:"
+                f" {match.rule}"
+            )
+            return _excluded_selection(path, is_dir, detail, gitignore_match=match)
+
+    normalized_path = "/" + root_relative_path
+    if is_dir:
+        normalized_path += "/"
+
+    for pattern, option_name in (
+        (exclude, "--exclude"),
+        (extend_exclude, "--extend-exclude"),
+        (force_exclude, "--force-exclude"),
+    ):
+        if path_is_excluded(normalized_path, pattern):
+            detail = f"matches the {option_name} regular expression"
+            return _excluded_selection(path, is_dir, detail)
+
+    if resolves_outside_root_or_cannot_stat(path, root):
+        try:
+            resolved_path = _cached_resolve(path)
+            resolved_path.relative_to(root)
+        except OSError as e:
+            detail = f"cannot be read because {e}"
+        except ValueError:
+            detail = f"is a symbolic link that points outside the project root {root}"
+        else:
+            # Defensive fallback: the precondition said the path is excluded.
+            detail = "cannot be stat-ed"
+        return _excluded_selection(path, is_dir, detail)
+
+    return None
+
+
+def _excluded_selection(
+    path: Path,
+    is_dir: bool,
+    detail: str,
+    *,
+    gitignore_match: GitignoreMatch | None = None,
+) -> SelectionExplanation:
+    if is_dir:
+        reason = f"ancestor directory {path} {detail}"
+        excluded_ancestor: Path | None = path
+    else:
+        reason = detail
+        excluded_ancestor = None
+    return SelectionExplanation(
+        path,
+        False,
+        reason,
+        gitignore_match=gitignore_match,
+        excluded_ancestor=excluded_ancestor,
+    )
+
+
+def explain_file_selection(
+    entry: Path | str,
+    target: Path | str,
+    root: Path,
+    include: Pattern[str],
+    exclude: Pattern[str],
+    extend_exclude: Pattern[str] | None,
+    force_exclude: Pattern[str] | None,
+    *,
+    use_gitignore: bool,
+) -> SelectionExplanation:
+    """Explain whether ``target`` would be selected by a recursive scan of ``entry``.
+
+    Replays the decision `gen_python_files` makes for one file. The directories
+    between the scan entry and the target are walked in traversal order and the
+    .gitignore, ``--exclude``, ``--extend-exclude``, ``--force-exclude`` and
+    symbolic link checks are applied at every step (in that order); the
+    ``--include`` regex is checked last, for the file itself. The first failed
+    check is reported. As in a real scan, a directory's .gitignore is only read
+    once the scan descends into it, so rules inside an already-excluded
+    directory are never loaded. The target file's contents are never read.
+
+    Raises `InvalidFileSelectionTarget` if the entry or target is missing, the
+    target is not a file inside the entry, or a path is otherwise invalid.
+    """
+    entry_path, target_path = _prepare_explain_paths(entry, target, root)
+
+    if use_gitignore:
+        gitignore_dict: dict[Path, GitIgnoreSpec] | None = {
+            root: get_gitignore(root),
+            entry_path: get_gitignore(entry_path),
+        }
+    else:
+        gitignore_dict = None
+
+    relative_parts = target_path.relative_to(entry_path).parts
+    current = entry_path
+    for name in relative_parts:
+        current = current / name
+        explanation = _selection_explanation_for_path(
+            current,
+            root,
+            exclude,
+            extend_exclude,
+            force_exclude,
+            gitignore_dict,
+        )
+        if explanation is not None:
+            # Reported paths must always name the file asked about.
+            return SelectionExplanation(
+                target_path,
+                False,
+                explanation.reason,
+                gitignore_match=explanation.gitignore_match,
+                excluded_ancestor=explanation.excluded_ancestor,
+            )
+        if current.is_dir() and gitignore_dict is not None:
+            # gen_python_files loads a directory's .gitignore only when it
+            # descends into it, after every check above has passed.
+            gitignore_dict = {**gitignore_dict, current: get_gitignore(current)}
+
+    root_relative_path = "/" + target_path.relative_to(root).as_posix()
+    if include.search(root_relative_path):
+        return SelectionExplanation(target_path, True)
+    return SelectionExplanation(
+        target_path,
+        False,
+        "does not match the --include regular expression",
+    )
 
 
 def gen_python_files(

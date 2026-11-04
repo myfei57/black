@@ -38,7 +38,9 @@ from black.const import (
     STDIN_PLACEHOLDER,
 )
 from black.files import (
+    InvalidFileSelectionTarget,
     best_effort_relative_path,
+    explain_file_selection,
     find_project_root,
     find_pyproject_toml,
     find_user_pyproject_toml,
@@ -485,6 +487,21 @@ def validate_regex(
     show_default=True,
 )
 @click.option(
+    "--explain-file-selection",
+    type=str,
+    help=(
+        "Explain whether FILE would be selected by a recursive scan of the directory"
+        " passed as SRC and report the first deciding rule, then exit without"
+        " formatting anything. The explanation uses the same logic as a normal run:"
+        " .gitignore rules (with the rule's file and line number), --include,"
+        " --exclude, --extend-exclude, --force-exclude and excluded ancestor"
+        " directories. FILE must be an existing file inside the SRC directory."
+        " Exit code 0 means the file would be selected, 1 means it would not, and 2"
+        " signals an error (such as a missing file or a file outside the SRC"
+        " directory)."
+    ),
+)
+@click.option(
     "-W",
     "--workers",
     type=click.IntRange(min=1),
@@ -585,6 +602,7 @@ def main(
     exclude: Pattern[str] | None,
     extend_exclude: Pattern[str] | None,
     force_exclude: Pattern[str] | None,
+    explain_file_selection: str | None,
     stdin_filename: str | None,
     workers: int | None,
     src: tuple[str, ...],
@@ -610,7 +628,7 @@ def main(
             + "\n\n'SRC' and 'code' cannot be passed simultaneously."
         )
         ctx.exit(1)
-    if not src and code is None:
+    if not src and code is None and explain_file_selection is None:
         out(main.get_usage(ctx) + "\n\nOne of 'SRC' or 'code' is required.")
         ctx.exit(1)
 
@@ -639,6 +657,20 @@ def main(
             " drives). Black will use its default configuration. Pass"
             " --config to select a configuration file or --quiet to silence"
             " this warning."
+        )
+
+    # This mode only explains file selection; exit before any cache or
+    # formatting machinery is touched.
+    if explain_file_selection is not None:
+        _run_file_selection_explanation(
+            ctx=ctx,
+            root=root,
+            src=src,
+            target_path=explain_file_selection,
+            include=include,
+            exclude=exclude,
+            extend_exclude=extend_exclude,
+            force_exclude=force_exclude,
         )
 
     if verbose:
@@ -825,6 +857,78 @@ def main(
     if "GITHUB_OUTPUT" in os.environ:
         report.write_github_outputs(Path(os.environ["GITHUB_OUTPUT"]))
     ctx.exit(report.return_code)
+
+
+def _run_file_selection_explanation(
+    *,
+    ctx: click.Context,
+    root: Path | None,
+    src: tuple[str, ...],
+    target_path: str,
+    include: Pattern[str],
+    exclude: Pattern[str] | None,
+    extend_exclude: Pattern[str] | None,
+    force_exclude: Pattern[str] | None,
+) -> None:
+    """Explain why ``target_path`` is or isn't selected when scanning ``src``.
+
+    Only one existing directory may be passed as SRC. The explanation uses the
+    same project root, path normalization and filter priority as a normal
+    recursive run. This function does not read the target's contents and exits
+    before any cache or formatting code runs. Exit codes are 0 (would be
+    selected), 1 (would not be selected) and 2 (bad invocation).
+    """
+    if len(src) != 1 or src[0] == "-":
+        raise click.UsageError(
+            "--explain-file-selection requires exactly one existing directory"
+            " to be passed as SRC.",
+            ctx=ctx,
+        )
+    entry = Path(src[0])
+    if not entry.is_dir():
+        raise click.UsageError(
+            f"--explain-file-selection SRC must be an existing directory: {entry}",
+            ctx=ctx,
+        )
+    if root is None:
+        raise click.UsageError(
+            "Could not identify a project root for the given SRC; pass a single"
+            " directory located on one drive.",
+            ctx=ctx,
+        )
+
+    # Mirror `get_sources`: gitignore files are only consulted with the default
+    # excludes, and in that case the default exclude regex is used.
+    effective_exclude = (
+        re_compile_maybe_verbose(DEFAULT_EXCLUDES) if exclude is None else exclude
+    )
+
+    try:
+        explanation = explain_file_selection(
+            entry=entry,
+            target=target_path,
+            root=root,
+            include=include,
+            exclude=effective_exclude,
+            extend_exclude=extend_exclude,
+            force_exclude=force_exclude,
+            use_gitignore=exclude is None,
+        )
+    except InvalidFileSelectionTarget as e:
+        raise click.UsageError(str(e), ctx=ctx) from None
+    except GitIgnorePatternError:
+        ctx.exit(1)
+
+    # The explanation is the command's result (like `git check-ignore`), so it
+    # is written to stdout; Black's progress messages all use stderr.
+    if explanation.selected:
+        click.echo(
+            f"{explanation.path} would be selected by a recursive scan of {entry}"
+        )
+        ctx.exit(0)
+    else:
+        click.echo(f"{explanation.path} would not be selected: {explanation.reason}")
+        ctx.exit(1)
 
 
 def get_sources(

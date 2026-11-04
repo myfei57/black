@@ -105,6 +105,11 @@
 
 <!-- Changes to how Black can be configured -->
 
+- Add a `--explain-file-selection FILE` option that reports whether `FILE` would be
+  selected by a recursive scan of the directory passed as `SRC`, together with the
+  first deciding rule (the matching `.gitignore` rule with its file and line number,
+  `--include`, `--exclude`, `--extend-exclude`, `--force-exclude`, or an excluded
+  ancestor directory), without formatting anything or touching the cache (#5398)
 - Enable the cache when using `--diff` to skip unmodified files and record unmodified
   files as well-formatted (#5499)
 - Respect `--skip-source-first-line` when formatting code passed through stdin (#5580)

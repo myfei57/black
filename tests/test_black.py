@@ -4171,6 +4171,560 @@ class TestFileCollection:
                 )
 
 
+def _explain_file_selection(
+    entry: Path,
+    target: Path,
+    *,
+    include: str = black.DEFAULT_INCLUDES,
+    exclude: str | None = None,
+    extend_exclude: str | None = None,
+    force_exclude: str | None = None,
+) -> black.files.SelectionExplanation:
+    """Call explain_file_selection the same way the CLI wires it up.
+
+    ``exclude=None`` means the default excludes are used (and .gitignore files
+    are consulted), mirroring a normal run without --exclude.
+    """
+    root, _ = black.find_project_root((str(entry),))
+    assert root is not None
+    effective_exclude = (
+        black.re_compile_maybe_verbose(black.DEFAULT_EXCLUDES)
+        if exclude is None
+        else compile_pattern(exclude)
+    )
+    return black.files.explain_file_selection(
+        entry=entry,
+        target=target,
+        root=root,
+        include=compile_pattern(include),
+        exclude=effective_exclude,
+        extend_exclude=(
+            compile_pattern(extend_exclude) if extend_exclude is not None else None
+        ),
+        force_exclude=(
+            compile_pattern(force_exclude) if force_exclude is not None else None
+        ),
+        use_gitignore=exclude is None,
+    )
+
+
+class TestExplainFileSelection:
+    def _make_project(self, tmp: Path) -> Path:
+        root = tmp.resolve()
+        (root / "pyproject.toml").write_text("[tool.black]\n", encoding="utf-8")
+        return root
+
+    def test_selected_file(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / "pkg").mkdir()
+            target = root / "pkg" / "a.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert explanation.selected
+            assert explanation.reason == ""
+            assert explanation.gitignore_match is None
+            assert explanation.excluded_ancestor is None
+
+    def test_include_mismatch(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            target = root / "notes.txt"
+            target.write_text("hello\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert not explanation.selected
+            assert (
+                explanation.reason == "does not match the --include regular expression"
+            )
+
+    def test_empty_include_selects_non_python_file(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            target = root / "notes.txt"
+            target.write_text("hello\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target, include="", exclude="")
+            assert explanation.selected
+
+    def test_gitignore_rule_file_and_line(self) -> None:
+        # Comments and blank lines are not rules, so the rule's line number is
+        # its physical line in the .gitignore file.
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / "sub").mkdir()
+            (root / "sub" / ".gitignore").write_text(
+                "# a comment\n\nsecret.py\n", encoding="utf-8"
+            )
+            target = root / "sub" / "secret.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert not explanation.selected
+            assert explanation.gitignore_match == black.files.GitignoreMatch(
+                root / "sub" / ".gitignore", 3, "secret.py"
+            )
+            assert f"{root / 'sub' / '.gitignore'}:3: secret.py" in explanation.reason
+
+    def test_nested_gitignore_deep_file_wins(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / ".gitignore").write_text("# root rules\n*.txt\n", encoding="utf-8")
+            (root / "sub").mkdir()
+            (root / "sub" / ".gitignore").write_text(
+                "\n# nested\nlocal.py\n", encoding="utf-8"
+            )
+            target = root / "sub" / "local.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert not explanation.selected
+            assert explanation.gitignore_match == black.files.GitignoreMatch(
+                root / "sub" / ".gitignore", 3, "local.py"
+            )
+
+    def test_gitignore_negation_in_same_file_reincludes(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / ".gitignore").write_text("*.py\n!important.py\n", encoding="utf-8")
+            target = root / "important.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert explanation.selected
+
+    def test_gitignore_cross_file_precedence_matches_normal_scan(self) -> None:
+        # Like Black's own _path_is_ignored: the first .gitignore (top down)
+        # that ignores the path decides; a negation deeper down does not win.
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / ".gitignore").write_text("*.py\n", encoding="utf-8")
+            (root / "sub").mkdir()
+            (root / "sub" / ".gitignore").write_text("!a.py\n", encoding="utf-8")
+            target = root / "sub" / "a.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert not explanation.selected
+            assert explanation.gitignore_match is not None
+            assert explanation.gitignore_match.gitignore == root / ".gitignore"
+            assert explanation.gitignore_match.line == 1
+
+    def test_excluded_ancestor_directory_by_gitignore(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / ".gitignore").write_text("vendor/\n", encoding="utf-8")
+            (root / "vendor").mkdir()
+            target = root / "vendor" / "v.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert not explanation.selected
+            assert explanation.excluded_ancestor == root / "vendor"
+            assert explanation.gitignore_match == black.files.GitignoreMatch(
+                root / ".gitignore", 1, "vendor/"
+            )
+            assert explanation.reason.startswith(
+                f"ancestor directory {root / 'vendor'} "
+            )
+
+    def test_excluded_ancestor_gitignore_is_never_read(self) -> None:
+        # The normal scan prunes an excluded directory before loading its
+        # .gitignore, so an unparseable .gitignore inside the excluded dir must
+        # not break the explanation (the scan never enters the dir to find it).
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / ".gitignore").write_text("vendor/\n", encoding="utf-8")
+            (root / "vendor").mkdir()
+            (root / "vendor" / ".gitignore").write_text("!\n", encoding="utf-8")
+            target = root / "vendor" / "v.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert not explanation.selected
+            assert explanation.excluded_ancestor == root / "vendor"
+
+    def test_excluded_ancestor_directory_by_exclude_regex(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / "generated").mkdir()
+            target = root / "generated" / "g.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(
+                root, target, exclude=r"^/generated/", include=black.DEFAULT_INCLUDES
+            )
+            assert not explanation.selected
+            assert explanation.excluded_ancestor == root / "generated"
+            assert explanation.reason.endswith(
+                "matches the --exclude regular expression"
+            )
+
+    def test_default_excludes_apply_to_ancestor(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / "build").mkdir()
+            target = root / "build" / "g.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target)
+            assert not explanation.selected
+            assert explanation.excluded_ancestor == root / "build"
+            assert "--exclude" in explanation.reason
+
+    def test_regex_priority_exclude_before_extend_and_force(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            target = root / "a.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+
+            explanation = _explain_file_selection(
+                root,
+                target,
+                exclude=r"a\.py",
+                extend_exclude=r"a\.py",
+                force_exclude=r"a\.py",
+            )
+            assert not explanation.selected
+            assert "--exclude" in explanation.reason
+            assert "--extend-exclude" not in explanation.reason
+
+            explanation = _explain_file_selection(
+                root, target, extend_exclude=r"a\.py", force_exclude=r"a\.py"
+            )
+            assert not explanation.selected
+            assert "--extend-exclude" in explanation.reason
+            assert "--force-exclude" not in explanation.reason
+
+            explanation = _explain_file_selection(root, target, force_exclude=r"a\.py")
+            assert not explanation.selected
+            assert "--force-exclude" in explanation.reason
+
+    def test_gitignore_has_priority_over_exclude_regex(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / ".gitignore").write_text("a.py\n", encoding="utf-8")
+            target = root / "a.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target, extend_exclude=r"a\.py")
+            assert not explanation.selected
+            assert ".gitignore rule" in explanation.reason
+            assert "--extend-exclude" not in explanation.reason
+
+    def test_custom_exclude_disables_gitignore(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / ".gitignore").write_text("a.py\n", encoding="utf-8")
+            target = root / "a.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            explanation = _explain_file_selection(root, target, exclude=r"zzz")
+            assert explanation.selected
+
+    def test_scan_entry_below_project_root(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            entry = root / "pkg"
+            entry.mkdir()
+            # A rule anchored at the project root still applies when scanning pkg.
+            (root / ".gitignore").write_text("/pkg/skip.py\n", encoding="utf-8")
+            target = entry / "skip.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            kept = entry / "keep.py"
+            kept.write_text("x = 1\n", encoding="utf-8")
+            assert not _explain_file_selection(entry, target).selected
+            assert _explain_file_selection(entry, kept).selected
+
+    def test_target_outside_entry(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            entry = root / "pkg"
+            entry.mkdir()
+            target = root / "escape.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            with pytest.raises(black.files.InvalidFileSelectionTarget, match="outside"):
+                _explain_file_selection(entry, target)
+
+    def test_target_with_parent_dirs_outside_entry(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            entry = root / "pkg"
+            entry.mkdir()
+            target = root / "escape.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            with change_directory(entry):
+                with pytest.raises(
+                    black.files.InvalidFileSelectionTarget, match="outside"
+                ):
+                    _explain_file_selection(Path("."), Path("../escape.py"))
+
+    def test_missing_or_invalid_targets(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / "pkg").mkdir()
+
+            with pytest.raises(
+                black.files.InvalidFileSelectionTarget, match="does not exist"
+            ):
+                _explain_file_selection(root, root / "pkg" / "missing.py")
+
+            target_dir = root / "pkg"
+            with pytest.raises(
+                black.files.InvalidFileSelectionTarget, match="not a file"
+            ):
+                _explain_file_selection(root, target_dir)
+
+            with pytest.raises(
+                black.files.InvalidFileSelectionTarget,
+                match="not an existing directory",
+            ):
+                _explain_file_selection(root / "pkg" / "missing.py", root / "pkg")
+
+    def test_broken_symlink_target_errors(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            link = root / "broken.py"
+            symlink_or_skip(link, root / "does_not_exist.py")
+            with pytest.raises(
+                black.files.InvalidFileSelectionTarget, match="does not exist"
+            ):
+                _explain_file_selection(root, link)
+
+    def test_symlink_outside_project_root(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            tmp = Path(tempdir).resolve()
+            root = tmp / "proj"
+            root.mkdir()
+            (root / "pyproject.toml").write_text("[tool.black]\n", encoding="utf-8")
+            outside = tmp / "outside"
+            outside.mkdir()
+            (outside / "a.py").write_text("x = 1\n", encoding="utf-8")
+            link = root / "link.py"
+            symlink_or_skip(link, outside / "a.py")
+
+            explanation = _explain_file_selection(root, link)
+            assert not explanation.selected
+            assert "symbolic link that points outside the project root" in (
+                explanation.reason
+            )
+            assert explanation.excluded_ancestor is None
+
+    def test_symlinked_directory_inside_root_is_followed(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            real = root / "real_dir"
+            real.mkdir()
+            (real / "a.py").write_text("x = 1\n", encoding="utf-8")
+            alias = root / "alias"
+            symlink_or_skip(alias, real)
+
+            explanation = _explain_file_selection(root, alias / "a.py")
+            assert explanation.selected
+
+    def test_symlink_with_excluded_name(self) -> None:
+        # The exclusion checks see the symbolic link's own name before the link
+        # target is resolved.
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            allowed = root / "allowed_dir"
+            allowed.mkdir()
+            (allowed / "m.py").write_text("x = 1\n", encoding="utf-8")
+            link = root / "venv"
+            symlink_or_skip(link, allowed)
+
+            explanation = _explain_file_selection(root, link / "m.py")
+            assert not explanation.selected
+            assert explanation.excluded_ancestor == link
+            assert "--exclude" in explanation.reason
+
+    def test_parity_with_get_sources(self) -> None:
+        # The strongest guarantee: over a tree exercising nested ignores,
+        # negations, default excludes and regex excludes, explain_file_selection
+        # must agree with get_sources for every file in the tree.
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / ".gitignore").write_text(
+                "ignore_me/\n*.log\n!important.log\n", encoding="utf-8"
+            )
+            (root / "keep.py").write_text("x=1\n", encoding="utf-8")
+            (root / "notes.txt").write_text("x\n", encoding="utf-8")
+            (root / "build").mkdir()
+            (root / "build" / "g.py").write_text("x=1\n", encoding="utf-8")
+            (root / "ignore_me").mkdir()
+            (root / "ignore_me" / "x.py").write_text("x=1\n", encoding="utf-8")
+            (root / "vendored").mkdir()
+            (root / "vendored" / "v.py").write_text("x=1\n", encoding="utf-8")
+            pkg = root / "pkg"
+            pkg.mkdir()
+            (pkg / ".gitignore").write_text("secret.py\n!secret.py\n", encoding="utf-8")
+            (pkg / "a.py").write_text("x=1\n", encoding="utf-8")
+            (pkg / "secret.py").write_text("x=1\n", encoding="utf-8")
+            (pkg / "debug.log").write_text("x\n", encoding="utf-8")
+            (pkg / "important.log").write_text("x\n", encoding="utf-8")
+
+            all_files = {p.resolve() for p in root.rglob("*") if p.is_file()}
+
+            sources = black.get_sources(
+                root=root,
+                src=(str(root),),
+                quiet=True,
+                verbose=False,
+                include=compile_pattern(black.DEFAULT_INCLUDES),
+                exclude=None,
+                extend_exclude=compile_pattern(r"/vendored/"),
+                force_exclude=None,
+                report=black.Report(),
+                stdin_filename=None,
+            )
+            selected = {p.resolve() for p in sources}
+
+            for target in all_files:
+                explanation = _explain_file_selection(
+                    root, target, extend_exclude=r"/vendored/"
+                )
+                assert explanation.selected == (target in selected), (
+                    target,
+                    explanation.reason,
+                )
+
+    def test_cli_exit_codes_and_output(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / "sub").mkdir()
+            (root / "sub" / ".gitignore").write_text(
+                "# comment\n\nskip.py\n", encoding="utf-8"
+            )
+            selected = root / "a.py"
+            selected.write_text("x = 1\n", encoding="utf-8")
+            ignored = root / "sub" / "skip.py"
+            ignored.write_text("x = 1\n", encoding="utf-8")
+            runner = BlackRunner()
+
+            result = runner.invoke(
+                black.main,
+                ["--explain-file-selection", str(selected), str(root)],
+            )
+            assert result.exit_code == 0
+            assert "would be selected" in result.stdout
+            assert result.stderr == ""
+
+            result = runner.invoke(
+                black.main,
+                ["--explain-file-selection", str(ignored), str(root)],
+            )
+            assert result.exit_code == 1
+            assert "would not be selected" in result.stdout
+            assert str(root / "sub" / ".gitignore") in result.stdout
+            assert ":3: skip.py" in result.stdout
+
+    def test_cli_error_cases(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            (root / "pkg").mkdir()
+            target = root / "pkg" / "a.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            runner = BlackRunner()
+
+            # Target outside the scan entry.
+            escape = root / "escape.py"
+            escape.write_text("x = 1\n", encoding="utf-8")
+            result = runner.invoke(
+                black.main,
+                ["--explain-file-selection", str(escape), str(root / "pkg")],
+            )
+            assert result.exit_code == 2
+            assert "outside the scan entry" in result.stderr
+
+            # Target does not exist.
+            result = runner.invoke(
+                black.main,
+                [
+                    "--explain-file-selection",
+                    str(root / "pkg" / "missing.py"),
+                    str(root),
+                ],
+            )
+            assert result.exit_code == 2
+            assert "does not exist" in result.stderr
+
+            # SRC must be a directory.
+            result = runner.invoke(
+                black.main,
+                ["--explain-file-selection", str(target), str(target)],
+            )
+            assert result.exit_code == 2
+            assert "existing directory" in result.stderr
+
+            # Exactly one SRC is required.
+            result = runner.invoke(
+                black.main,
+                ["--explain-file-selection", str(target)],
+            )
+            assert result.exit_code == 2
+            result = runner.invoke(
+                black.main,
+                [
+                    "--explain-file-selection",
+                    str(target),
+                    str(root),
+                    str(root / "pkg"),
+                ],
+            )
+            assert result.exit_code == 2
+
+    def test_cli_honors_pyproject_excludes(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = Path(tempdir).resolve()
+            (root / "pyproject.toml").write_text(
+                "[tool.black]\nextend-exclude = '/gen/'\n", encoding="utf-8"
+            )
+            (root / "gen").mkdir()
+            target = root / "gen" / "a.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            result = BlackRunner().invoke(
+                black.main,
+                ["--explain-file-selection", str(target), str(root)],
+            )
+            assert result.exit_code == 1
+            assert "--extend-exclude" in result.stdout
+
+    def test_cli_invalid_reachable_gitignore_errors_like_normal_run(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = Path(tempdir).resolve()
+            (root / "pyproject.toml").write_text("[tool.black]\n", encoding="utf-8")
+            # A lone "!" is an invalid gitignore pattern.
+            (root / ".gitignore").write_text("!\n", encoding="utf-8")
+            target = root / "a.py"
+            target.write_text("x = 1\n", encoding="utf-8")
+            result = BlackRunner().invoke(
+                black.main,
+                ["--explain-file-selection", str(target), str(root)],
+            )
+            assert result.exit_code == 1
+            assert f"Could not parse {root / '.gitignore'}" in result.stderr
+
+    def test_cli_illegal_target_path_errors(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            result = BlackRunner().invoke(
+                black.main,
+                ["--explain-file-selection", "bad\x00name.py", str(root)],
+            )
+            assert result.exit_code == 2
+
+    def test_cli_does_not_format_touch_cache_or_read_target_contents(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tempdir:
+            root = self._make_project(Path(tempdir))
+            target = root / "a.py"
+            target.write_text("x=1\n", encoding="utf-8")
+            with cache_dir(exists=False) as cache:
+                with patch("black.pygram.initialize") as initialize:
+                    result = BlackRunner().invoke(
+                        black.main,
+                        ["--explain-file-selection", str(target), str(root)],
+                    )
+            assert result.exit_code == 0
+            # No grammar/cache initialization happened and no cache was created.
+            initialize.assert_not_called()
+            assert not cache.exists()
+            # The target was not formatted (Black would insert spaces).
+            assert target.read_text(encoding="utf-8") == "x=1\n"
+            # The explanation does not leak source contents into its output.
+            assert "x=1" not in result.stdout
+
+
 class TestDeFactoAPI:
     """Test that certain symbols that are commonly used externally keep working.
 
